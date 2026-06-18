@@ -1,0 +1,22 @@
+manifestVersion: 1
+id: ilya-disk-status
+name: Disk Status
+tagline: Simple external disk usage viewer
+category: files
+version: "1.0.0"
+port: 8080
+description: >-
+  Simple page showing used and free space for Umbrel external disks.
+developer: Ilya
+website: https://github.com/Wilmarrr/ilya-umbrel-app-store
+submitter: Ilya
+submission: https://github.com/Wilmarrr/ilya-umbrel-app-store
+repo: https://github.com/Wilmarrr/ilya-umbrel-app-store
+support: https://github.com/Wilmarrr/ilya-umbrel-app-store/issues
+gallery: []
+releaseNotes: >-
+  Initial version.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
