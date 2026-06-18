@@ -7,7 +7,9 @@ services:
   server:
     image: python:3.12-alpine
     restart: on-failure
+    pid: host
     volumes:
+      - /:/hostroot:ro,rslave
       - ${UMBREL_ROOT}:/umbrel-root:ro
       - ${UMBREL_ROOT}/external:/external:ro,rslave
     command:
@@ -22,23 +24,49 @@ services:
 
         SYSTEM_PATH = "/umbrel-root"
         EXTERNAL_ROOT = "/external"
+        HOSTROOT = "/hostroot"
+
+        NETWORK_FS_TYPES = {
+            "cifs",
+            "smb3",
+            "nfs",
+            "nfs4",
+            "fuse.sshfs",
+            "sshfs",
+            "fuse.rclone",
+            "rclone",
+            "davfs",
+            "fuse.davfs",
+            "fuse.webdav",
+            "9p",
+            "virtiofs",
+        }
+
+        SKIP_HOST_PREFIXES = (
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/var/lib/docker",
+            "/var/lib/containerd",
+            "/data/docker",
+            "/data/data/docker",
+            "/tmp",
+            "/boot",
+        )
+
+        def decode_mount_path(value):
+            return value.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+        def host_to_container_path(host_path):
+            if host_path == "/":
+                return HOSTROOT
+            return HOSTROOT + host_path
 
         def gib(bytes_value):
             return round(bytes_value / 1073741824, 1)
 
-        def read_mount_points():
-            points = set()
-            try:
-                with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            points.add(parts[4].replace("\\040", " "))
-            except Exception:
-                pass
-            return points
-
-        def disk_info(name, path, kind, parent_dev=None, mount_points=None):
+        def stat_disk(name, path, kind, source="", fs_type="", mounted=True, host_path=""):
             st_path = os.stat(path)
             st = os.statvfs(path)
             total = st.f_blocks * st.f_frsize
@@ -46,35 +74,99 @@ services:
             used = total - free
             percent = round((used / total) * 100, 1) if total else 0
 
-            is_mounted = True
-            if kind == "external":
-                is_mounted = False
-                if parent_dev is not None and st_path.st_dev != parent_dev:
-                    is_mounted = True
-                if mount_points and path in mount_points:
-                    is_mounted = True
-
             return {
                 "name": name,
                 "path": path,
+                "host_path": host_path,
                 "kind": kind,
+                "source": source,
+                "fs_type": fs_type,
                 "device_id": st_path.st_dev,
-                "mounted": is_mounted,
+                "mounted": mounted,
                 "total_gb": gib(total),
                 "used_gb": gib(used),
                 "free_gb": gib(free),
                 "percent": percent,
             }
 
-        def get_data():
-            result = []
-            seen_devices = set()
-            mount_points = read_mount_points()
-
+        def parse_mountinfo_file(path):
+            mounts = []
             try:
-                system = disk_info("UMBREL_DATA", SYSTEM_PATH, "system", mount_points=mount_points)
-                result.append(system)
-                seen_devices.add(system["device_id"])
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) < 10 or "-" not in parts:
+                            continue
+
+                        sep = parts.index("-")
+                        mount_point = decode_mount_path(parts[4])
+                        fs_type = parts[sep + 1] if len(parts) > sep + 1 else ""
+                        source = decode_mount_path(parts[sep + 2]) if len(parts) > sep + 2 else ""
+
+                        mounts.append({
+                            "mount_point": mount_point,
+                            "fs_type": fs_type,
+                            "source": source,
+                        })
+            except Exception:
+                pass
+            return mounts
+
+        def read_host_mounts():
+            mounts = parse_mountinfo_file("/proc/1/mountinfo")
+            if not mounts:
+                mounts = parse_mountinfo_file("/proc/self/mountinfo")
+            return mounts
+
+        def is_network_mount(mount):
+            fs_type = mount.get("fs_type", "")
+            source = mount.get("source", "")
+            mount_point = mount.get("mount_point", "")
+
+            if not mount_point or mount_point == "/":
+                return False
+
+            for prefix in SKIP_HOST_PREFIXES:
+                if mount_point == prefix or mount_point.startswith(prefix + "/"):
+                    return False
+
+            if fs_type in NETWORK_FS_TYPES:
+                return True
+
+            if fs_type.startswith("fuse.") and (
+                "rclone" in fs_type or
+                "sshfs" in fs_type or
+                "dav" in fs_type or
+                "webdav" in fs_type
+            ):
+                return True
+
+            if source.startswith("//"):
+                return True
+
+            if ":" in source and fs_type in ("nfs", "nfs4", "fuse.sshfs", "sshfs"):
+                return True
+
+            return False
+
+        def nice_network_name(mount):
+            mount_point = mount.get("mount_point", "").rstrip("/")
+            source = mount.get("source", "")
+            base = os.path.basename(mount_point)
+            if base:
+                return base
+            if source:
+                return source.replace("/", "_").replace(":", "_")
+            return "network_mount"
+
+        def read_mount_points():
+            return set(m["mount_point"] for m in read_host_mounts())
+
+        def add_system_disk(result, seen_devices):
+            try:
+                info = stat_disk("UMBREL_DATA", SYSTEM_PATH, "system", host_path="${UMBREL_ROOT}")
+                result.append(info)
+                seen_devices.add(info["device_id"])
             except Exception as err:
                 result.append({
                     "name": "UMBREL_DATA",
@@ -84,6 +176,7 @@ services:
                     "error": str(err),
                 })
 
+        def add_external_disks(result, seen_devices, mount_points):
             try:
                 parent_dev = os.stat(EXTERNAL_ROOT).st_dev
                 names = sorted(os.listdir(EXTERNAL_ROOT))
@@ -97,7 +190,14 @@ services:
                     continue
 
                 try:
-                    info = disk_info(dirname, path, "external", parent_dev=parent_dev, mount_points=mount_points)
+                    st_path = os.stat(path)
+                    is_mounted = False
+                    if parent_dev is not None and st_path.st_dev != parent_dev:
+                        is_mounted = True
+                    if ("/home/umbrel/umbrel/external/" + dirname) in mount_points:
+                        is_mounted = True
+
+                    info = stat_disk(dirname, path, "external", mounted=is_mounted, host_path="/home/umbrel/umbrel/external/" + dirname)
 
                     if not info["mounted"]:
                         info["status"] = "waiting_for_mount"
@@ -120,6 +220,66 @@ services:
                         "error": str(err),
                     })
 
+        def add_network_disks(result, seen_devices, mounts):
+            network_mounts = [m for m in mounts if is_network_mount(m)]
+
+            for mount in network_mounts:
+                host_path = mount["mount_point"]
+                path = host_to_container_path(host_path)
+
+                try:
+                    if not os.path.exists(path):
+                        result.append({
+                            "name": nice_network_name(mount),
+                            "path": path,
+                            "host_path": host_path,
+                            "kind": "network",
+                            "source": mount.get("source", ""),
+                            "fs_type": mount.get("fs_type", ""),
+                            "mounted": False,
+                            "error": "Mount exists in host mountinfo, but is not visible inside container",
+                        })
+                        continue
+
+                    info = stat_disk(
+                        nice_network_name(mount),
+                        path,
+                        "network",
+                        source=mount.get("source", ""),
+                        fs_type=mount.get("fs_type", ""),
+                        mounted=True,
+                        host_path=host_path,
+                    )
+
+                    if info["device_id"] in seen_devices:
+                        info["status"] = "duplicate_device_hidden"
+                        continue
+
+                    info["status"] = "mounted"
+                    result.append(info)
+                    seen_devices.add(info["device_id"])
+                except Exception as err:
+                    result.append({
+                        "name": nice_network_name(mount),
+                        "path": path,
+                        "host_path": host_path,
+                        "kind": "network",
+                        "source": mount.get("source", ""),
+                        "fs_type": mount.get("fs_type", ""),
+                        "mounted": False,
+                        "error": str(err),
+                    })
+
+        def get_data():
+            result = []
+            seen_devices = set()
+            mounts = read_host_mounts()
+            mount_points = set(m["mount_point"] for m in mounts)
+
+            add_system_disk(result, seen_devices)
+            add_external_disks(result, seen_devices, mount_points)
+            add_network_disks(result, seen_devices, mounts)
+
             return {
                 "disks": result,
                 "updated_at": int(time.time()),
@@ -141,7 +301,7 @@ services:
               color: #e5e7eb;
             }
             .wrap {
-              max-width: 1100px;
+              max-width: 1180px;
               margin: 34px auto;
               padding: 0 20px 40px;
             }
@@ -167,7 +327,7 @@ services:
               box-shadow: 0 16px 40px rgba(0,0,0,.35);
             }
             .card.waiting {
-              opacity: .65;
+              opacity: .72;
               border-style: dashed;
             }
             .top {
@@ -190,6 +350,12 @@ services:
               font-weight: 700;
               letter-spacing: .02em;
               text-transform: uppercase;
+            }
+            .source {
+              color: #64748b;
+              font-size: 12px;
+              margin-top: 8px;
+              overflow-wrap: anywhere;
             }
             .percent {
               font-size: 34px;
@@ -255,7 +421,7 @@ services:
         <body>
           <div class="wrap">
             <h1>Disk Status</h1>
-            <div class="sub">Системный раздел Umbrel и все внешние диски из папки external. Обновление каждые 5 секунд.</div>
+            <div class="sub">Системный раздел, внешние диски и сетевые mount-диски. Обновление каждые 5 секунд.</div>
             <div id="app">Загрузка...</div>
             <div class="footer" id="updated"></div>
           </div>
@@ -272,10 +438,33 @@ services:
               if (d.kind === "system") {
                 return "system / data";
               }
+              if (d.kind === "network") {
+                if (d.fs_type) {
+                  return "network " + d.fs_type;
+                }
+                return "network";
+              }
               if (d.mounted) {
                 return "external mounted";
               }
               return "external waiting";
+            }
+
+            function sourceHtml(d) {
+              let parts = [];
+              if (d.source) {
+                parts.push("source: " + text(d.source));
+              }
+              if (d.host_path) {
+                parts.push("path: " + text(d.host_path));
+              }
+              if (parts.length === 0 && d.path) {
+                parts.push("path: " + text(d.path));
+              }
+              if (parts.length === 0) {
+                return "";
+              }
+              return '<div class="source">' + parts.join(" · ") + '</div>';
             }
 
             function diskHtml(d) {
@@ -286,7 +475,7 @@ services:
                   '<div class="name">' + text(d.name) + '</div>' +
                   '<div class="badge">' + kindLabel(d) + '</div>' +
                   '<p class="error">' + text(d.error) + '</p>' +
-                  '<p>' + text(d.path) + '</p>' +
+                  sourceHtml(d) +
                   '</div>';
               }
 
@@ -297,7 +486,7 @@ services:
                     '<div class="percent">—</div>' +
                   '</div>' +
                   '<p class="hint">Папка есть, но отдельный диск сейчас не смонтирован. Жду mount.</p>' +
-                  '<p>' + text(d.path) + '</p>' +
+                  sourceHtml(d) +
                 '</div>';
               }
 
@@ -312,6 +501,7 @@ services:
                   '<div class="stat"><div class="label">Свободно</div><div class="value">' + text(d.free_gb) + ' GB</div></div>' +
                   '<div class="stat"><div class="label">Всего</div><div class="value">' + text(d.total_gb) + ' GB</div></div>' +
                 '</div>' +
+                sourceHtml(d) +
               '</div>';
             }
 

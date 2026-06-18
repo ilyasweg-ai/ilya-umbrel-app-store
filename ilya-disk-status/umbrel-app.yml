@@ -1,13 +1,13 @@
 manifestVersion: 1
 id: ilya-disk-status
 name: Disk Status
-tagline: Simple external disk usage viewer
+tagline: Simple disk and network mount usage viewer
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-disk-status/icon.svg
 category: files
-version: "1.1.0"
+version: "1.2.0"
 port: 8080
 description: >-
-  Simple page showing used and free space for Umbrel system/data storage and mounted external disks.
+  Simple page showing used and free space for Umbrel system/data storage, mounted external disks, and network mounts.
 developer: Ilya
 website: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 submitter: Ilya
@@ -16,7 +16,7 @@ repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Dynamic disk discovery: shows Umbrel data disk and mounted external disks from the external folder. Uses rslave bind propagation so disks mounted after app start can appear without manual app restart.
+  Added network mount discovery for SMB/CIFS, NFS, SSHFS, WebDAV and rclone-like mounts. Also scans host mountinfo and refreshes every 5 seconds.
 dependencies: []
 path: ""
 defaultUsername: ""
