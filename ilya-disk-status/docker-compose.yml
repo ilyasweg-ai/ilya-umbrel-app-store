@@ -1,5 +1,3 @@
-version: "3.7"
-
 services:
   app_proxy:
     environment:
@@ -9,17 +7,9 @@ services:
   server:
     image: python:3.12-alpine
     restart: on-failure
-    init: true
-    stop_grace_period: 1m
     volumes:
-      - type: bind
-        source: ${UMBREL_ROOT}/external/ssd990_main
-        target: /disks/ssd990_main
-        read_only: true
-      - type: bind
-        source: ${UMBREL_ROOT}/external/backup_umbrel_hdd
-        target: /disks/backup_umbrel_hdd
-        read_only: true
+      - ${UMBREL_ROOT}/external/ssd990_main:/disks/ssd990_main:ro
+      - ${UMBREL_ROOT}/external/backup_umbrel_hdd:/disks/backup_umbrel_hdd:ro
     command:
       - sh
       - -c
