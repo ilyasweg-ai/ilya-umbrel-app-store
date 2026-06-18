@@ -29,7 +29,6 @@ services:
         import json
         import os
         import time
-        import html
 
         DISKS = {
             "SSD990_MAIN": "/disks/ssd990_main",
@@ -58,8 +57,8 @@ services:
             for name, path in DISKS.items():
                 try:
                     result[name] = disk_info(path)
-                except Exception as e:
-                    result[name] = {"error": str(e), "path": path}
+                except Exception as err:
+                    result[name] = {"error": str(err), "path": path}
             result["updated_at"] = int(time.time())
             return result
 
@@ -180,42 +179,34 @@ services:
           </div>
 
           <script>
-            function safeText(v) {
-              return String(v ?? '');
+            function text(v) {
+              if (v === undefined || v === null) {
+                return "";
+              }
+              return String(v);
             }
 
-            function renderDisk(name, d) {
+            function diskHtml(name, d) {
               if (d.error) {
-                return `<div class="card">
-                  <div class="name">${safeText(name)}</div>
-                  <p class="error">${safeText(d.error)}</p>
-                  <p>${safeText(d.path)}</p>
-                </div>`;
+                return '<div class="card">' +
+                  '<div class="name">' + text(name) + '</div>' +
+                  '<p class="error">' + text(d.error) + '</p>' +
+                  '<p>' + text(d.path) + '</p>' +
+                  '</div>';
               }
 
-              return `
-                <div class="card">
-                  <div class="top">
-                    <div class="name">${safeText(name)}</div>
-                    <div class="percent">${d.percent}%</div>
-                  </div>
-                  <div class="bar"><div class="fill" style="width:${d.percent}%"></div></div>
-                  <div class="stats">
-                    <div class="stat">
-                      <div class="label">Занято</div>
-                      <div class="value">${d.used_gb} GB</div>
-                    </div>
-                    <div class="stat">
-                      <div class="label">Свободно</div>
-                      <div class="value">${d.free_gb} GB</div>
-                    </div>
-                    <div class="stat">
-                      <div class="label">Всего</div>
-                      <div class="value">${d.total_gb} GB</div>
-                    </div>
-                  </div>
-                </div>
-              `;
+              return '<div class="card">' +
+                '<div class="top">' +
+                  '<div class="name">' + text(name) + '</div>' +
+                  '<div class="percent">' + text(d.percent) + '%</div>' +
+                '</div>' +
+                '<div class="bar"><div class="fill" style="width:' + text(d.percent) + '%"></div></div>' +
+                '<div class="stats">' +
+                  '<div class="stat"><div class="label">Занято</div><div class="value">' + text(d.used_gb) + ' GB</div></div>' +
+                  '<div class="stat"><div class="label">Свободно</div><div class="value">' + text(d.free_gb) + ' GB</div></div>' +
+                  '<div class="stat"><div class="label">Всего</div><div class="value">' + text(d.total_gb) + ' GB</div></div>' +
+                '</div>' +
+              '</div>';
             }
 
             async function load() {
@@ -223,15 +214,18 @@ services:
                 const res = await fetch('api/disks');
                 const data = await res.json();
 
-                const html = Object.keys(data)
-                  .filter(k => k !== 'updated_at')
-                  .map(k => renderDisk(k, data[k]))
-                  .join('');
+                let result = "";
+                Object.keys(data).forEach(function(k) {
+                  if (k !== "updated_at") {
+                    result += diskHtml(k, data[k]);
+                  }
+                });
 
-                document.getElementById('app').innerHTML = `<div class="grid">${html}</div>`;
+                document.getElementById('app').innerHTML = '<div class="grid">' + result + '</div>';
                 document.getElementById('updated').textContent = 'Последнее обновление: ' + new Date().toLocaleString();
-              } catch (e) {
-                document.getElementById('app').innerHTML = `<div class="card"><p class="error">${e}</p></div>`;
+              } catch (err) {
+                document.getElementById('app').innerHTML =
+                  '<div class="card"><p class="error">' + String(err) + '</p></div>';
               }
             }
 
