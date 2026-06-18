@@ -4,7 +4,7 @@ name: Disk Status
 tagline: Simple disk and network mount usage viewer
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-disk-status/icon.svg
 category: files
-version: "1.2.0"
+version: "1.3.0"
 port: 8080
 description: >-
   Simple page showing used and free space for Umbrel system/data storage, mounted external disks, and network mounts.
@@ -16,7 +16,7 @@ repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Added network mount discovery for SMB/CIFS, NFS, SSHFS, WebDAV and rclone-like mounts. Also scans host mountinfo and refreshes every 5 seconds.
+  Hides external folders that are not real mounted disks, shows path/source on every card, and avoids duplicate external disk cards.
 dependencies: []
 path: ""
 defaultUsername: ""
