@@ -1,13 +1,13 @@
 manifestVersion: 1
 id: ilya-disk-status
 name: Disk Status
-tagline: Simple disk and network mount usage viewer
+tagline: Simple disk, network mount and history viewer
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-disk-status/icon.svg
 category: files
-version: "1.3.2"
+version: "1.4.0"
 port: 8080
 description: >-
-  Simple page showing used and free space for Umbrel system/data storage, mounted external disks, and network mounts.
+  Simple page showing used and free space for Umbrel system/data storage, mounted external disks, network mounts, disk usage history, and top folders.
 developer: Ilya
 website: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 submitter: Ilya
@@ -16,7 +16,7 @@ repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Fixed YAML packaging bug from 1.3.1. Hides external folders that are not real mounted disks, shows path/source on every card, and avoids duplicate external disk cards.
+  Added persistent disk history with interactive chart, critical colors, last change tracking, collapsible hidden folders, and manual top folders scan.
 dependencies: []
 path: ""
 defaultUsername: ""
