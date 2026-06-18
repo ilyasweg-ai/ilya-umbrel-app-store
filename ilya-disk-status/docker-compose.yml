@@ -8,8 +8,8 @@ services:
     image: python:3.12-alpine
     restart: on-failure
     volumes:
-      - ${UMBREL_ROOT}/external/ssd990_main:/disks/ssd990_main:ro
-      - ${UMBREL_ROOT}/external/backup_umbrel_hdd:/disks/backup_umbrel_hdd:ro
+      - ${UMBREL_ROOT}:/umbrel-root:ro
+      - ${UMBREL_ROOT}/external:/external:ro,rslave
     command:
       - sh
       - -c
@@ -20,22 +20,46 @@ services:
         import os
         import time
 
-        DISKS = {
-            "SSD990_MAIN": "/disks/ssd990_main",
-            "BACKUP_HDD": "/disks/backup_umbrel_hdd",
-        }
+        SYSTEM_PATH = "/umbrel-root"
+        EXTERNAL_ROOT = "/external"
 
         def gib(bytes_value):
             return round(bytes_value / 1073741824, 1)
 
-        def disk_info(path):
+        def read_mount_points():
+            points = set()
+            try:
+                with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            points.add(parts[4].replace("\\040", " "))
+            except Exception:
+                pass
+            return points
+
+        def disk_info(name, path, kind, parent_dev=None, mount_points=None):
+            st_path = os.stat(path)
             st = os.statvfs(path)
             total = st.f_blocks * st.f_frsize
             free = st.f_bavail * st.f_frsize
             used = total - free
             percent = round((used / total) * 100, 1) if total else 0
+
+            is_mounted = True
+            if kind == "external":
+                is_mounted = False
+                if parent_dev is not None and st_path.st_dev != parent_dev:
+                    is_mounted = True
+                if mount_points and path in mount_points:
+                    is_mounted = True
+
             return {
+                "name": name,
                 "path": path,
+                "kind": kind,
+                "device_id": st_path.st_dev,
+                "mounted": is_mounted,
                 "total_gb": gib(total),
                 "used_gb": gib(used),
                 "free_gb": gib(free),
@@ -43,14 +67,63 @@ services:
             }
 
         def get_data():
-            result = {}
-            for name, path in DISKS.items():
+            result = []
+            seen_devices = set()
+            mount_points = read_mount_points()
+
+            try:
+                system = disk_info("UMBREL_DATA", SYSTEM_PATH, "system", mount_points=mount_points)
+                result.append(system)
+                seen_devices.add(system["device_id"])
+            except Exception as err:
+                result.append({
+                    "name": "UMBREL_DATA",
+                    "path": SYSTEM_PATH,
+                    "kind": "system",
+                    "mounted": False,
+                    "error": str(err),
+                })
+
+            try:
+                parent_dev = os.stat(EXTERNAL_ROOT).st_dev
+                names = sorted(os.listdir(EXTERNAL_ROOT))
+            except Exception:
+                parent_dev = None
+                names = []
+
+            for dirname in names:
+                path = os.path.join(EXTERNAL_ROOT, dirname)
+                if not os.path.isdir(path):
+                    continue
+
                 try:
-                    result[name] = disk_info(path)
+                    info = disk_info(dirname, path, "external", parent_dev=parent_dev, mount_points=mount_points)
+
+                    if not info["mounted"]:
+                        info["status"] = "waiting_for_mount"
+                        result.append(info)
+                        continue
+
+                    if info["device_id"] in seen_devices:
+                        info["status"] = "duplicate_device_hidden"
+                        continue
+
+                    info["status"] = "mounted"
+                    result.append(info)
+                    seen_devices.add(info["device_id"])
                 except Exception as err:
-                    result[name] = {"error": str(err), "path": path}
-            result["updated_at"] = int(time.time())
-            return result
+                    result.append({
+                        "name": dirname,
+                        "path": path,
+                        "kind": "external",
+                        "mounted": False,
+                        "error": str(err),
+                    })
+
+            return {
+                "disks": result,
+                "updated_at": int(time.time()),
+            }
 
         def page():
             return """<!doctype html>
@@ -68,8 +141,8 @@ services:
               color: #e5e7eb;
             }
             .wrap {
-              max-width: 940px;
-              margin: 40px auto;
+              max-width: 1100px;
+              margin: 34px auto;
               padding: 0 20px 40px;
             }
             h1 {
@@ -79,19 +152,23 @@ services:
             }
             .sub {
               color: #94a3b8;
-              margin-bottom: 28px;
+              margin-bottom: 24px;
             }
             .grid {
               display: grid;
-              grid-template-columns: repeat(2, minmax(0, 1fr));
+              grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
               gap: 18px;
             }
             .card {
-              background: rgba(15, 23, 42, 0.9);
+              background: rgba(15, 23, 42, 0.92);
               border: 1px solid #243244;
               border-radius: 22px;
               padding: 22px;
               box-shadow: 0 16px 40px rgba(0,0,0,.35);
+            }
+            .card.waiting {
+              opacity: .65;
+              border-style: dashed;
             }
             .top {
               display: flex;
@@ -103,10 +180,21 @@ services:
             .name {
               font-size: 22px;
               font-weight: 800;
+              word-break: break-word;
+            }
+            .badge {
+              display: inline-block;
+              margin-top: 6px;
+              color: #93c5fd;
+              font-size: 12px;
+              font-weight: 700;
+              letter-spacing: .02em;
+              text-transform: uppercase;
             }
             .percent {
               font-size: 34px;
               font-weight: 900;
+              white-space: nowrap;
             }
             .bar {
               height: 20px;
@@ -148,6 +236,10 @@ services:
               font-weight: 800;
               word-break: break-word;
             }
+            .hint {
+              color: #fbbf24;
+              font-weight: 700;
+            }
             .footer {
               margin-top: 18px;
               color: #64748b;
@@ -163,7 +255,7 @@ services:
         <body>
           <div class="wrap">
             <h1>Disk Status</h1>
-            <div class="sub">Занятость внешних дисков Umbrel. Обновление каждые 10 секунд.</div>
+            <div class="sub">Системный раздел Umbrel и все внешние диски из папки external. Обновление каждые 5 секунд.</div>
             <div id="app">Загрузка...</div>
             <div class="footer" id="updated"></div>
           </div>
@@ -176,18 +268,42 @@ services:
               return String(v);
             }
 
-            function diskHtml(name, d) {
+            function kindLabel(d) {
+              if (d.kind === "system") {
+                return "system / data";
+              }
+              if (d.mounted) {
+                return "external mounted";
+              }
+              return "external waiting";
+            }
+
+            function diskHtml(d) {
+              const cardClass = d.mounted ? "card" : "card waiting";
+
               if (d.error) {
-                return '<div class="card">' +
-                  '<div class="name">' + text(name) + '</div>' +
+                return '<div class="' + cardClass + '">' +
+                  '<div class="name">' + text(d.name) + '</div>' +
+                  '<div class="badge">' + kindLabel(d) + '</div>' +
                   '<p class="error">' + text(d.error) + '</p>' +
                   '<p>' + text(d.path) + '</p>' +
                   '</div>';
               }
 
-              return '<div class="card">' +
+              if (!d.mounted) {
+                return '<div class="' + cardClass + '">' +
+                  '<div class="top">' +
+                    '<div><div class="name">' + text(d.name) + '</div><div class="badge">' + kindLabel(d) + '</div></div>' +
+                    '<div class="percent">—</div>' +
+                  '</div>' +
+                  '<p class="hint">Папка есть, но отдельный диск сейчас не смонтирован. Жду mount.</p>' +
+                  '<p>' + text(d.path) + '</p>' +
+                '</div>';
+              }
+
+              return '<div class="' + cardClass + '">' +
                 '<div class="top">' +
-                  '<div class="name">' + text(name) + '</div>' +
+                  '<div><div class="name">' + text(d.name) + '</div><div class="badge">' + kindLabel(d) + '</div></div>' +
                   '<div class="percent">' + text(d.percent) + '%</div>' +
                 '</div>' +
                 '<div class="bar"><div class="fill" style="width:' + text(d.percent) + '%"></div></div>' +
@@ -201,14 +317,12 @@ services:
 
             async function load() {
               try {
-                const res = await fetch('api/disks');
+                const res = await fetch('api/disks?ts=' + Date.now(), { cache: 'no-store' });
                 const data = await res.json();
-
                 let result = "";
-                Object.keys(data).forEach(function(k) {
-                  if (k !== "updated_at") {
-                    result += diskHtml(k, data[k]);
-                  }
+
+                data.disks.forEach(function(d) {
+                  result += diskHtml(d);
                 });
 
                 document.getElementById('app').innerHTML = '<div class="grid">' + result + '</div>';
@@ -220,7 +334,7 @@ services:
             }
 
             load();
-            setInterval(load, 10000);
+            setInterval(load, 5000);
           </script>
         </body>
         </html>"""
@@ -232,6 +346,7 @@ services:
                     body = page().encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -241,6 +356,7 @@ services:
                     body = json.dumps(get_data(), ensure_ascii=False).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
