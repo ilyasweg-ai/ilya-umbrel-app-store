@@ -18,127 +18,275 @@ services:
         cat > /tmp/server.py <<'PY'
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import json, os, time
+import json
+import os
+import re
+import time
 
 HOSTROOT = "/hostroot"
 SYSTEM_PATH = "/umbrel-root"
-HOST_UMBREL_ROOT = "${UMBREL_ROOT}"
-HOST_EXTERNAL_ROOT = HOST_UMBREL_ROOT.rstrip("/") + "/external"
+HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
+HOST_EXTERNAL_ROOT = HOST_UMBREL_ROOT + "/external"
 
-NETWORK_FS_TYPES = {"cifs","smb3","nfs","nfs4","fuse.sshfs","sshfs","fuse.rclone","rclone","davfs","fuse.davfs","fuse.webdav","9p","virtiofs"}
-SKIP_PREFIXES = ("/proc","/sys","/dev","/run","/tmp","/boot","/var/lib/docker","/var/lib/containerd","/data/docker","/data/data/docker","/data/data/volumes")
+NETWORK_FS_TYPES = {
+    "cifs", "smb3", "nfs", "nfs4", "fuse.sshfs", "sshfs",
+    "fuse.rclone", "rclone", "davfs", "fuse.davfs", "fuse.webdav",
+    "9p", "virtiofs"
+}
 
-def dec(s):
-    return s.replace("\\040"," ").replace("\\011","\t").replace("\\012","\n").replace("\\134","\\")
+SKIP_PREFIXES = (
+    "/proc", "/sys", "/dev", "/run", "/tmp", "/boot",
+    "/var/lib/docker", "/var/lib/containerd",
+    "/data/docker", "/data/data/docker", "/data/data/volumes"
+)
 
-def under(path, parent):
+def decode_path(value):
+    return (
+        value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+def is_under(path, parent):
     parent = parent.rstrip("/")
     return path == parent or path.startswith(parent + "/")
 
-def host_path(path):
-    return HOSTROOT if path == "/" else HOSTROOT + path
+def container_path(host_path):
+    return HOSTROOT if host_path == "/" else HOSTROOT + host_path
 
-def gib(x):
-    return round(x / 1073741824, 1)
+def gib(value):
+    return round(value / 1073741824, 1)
 
-def mounts():
+def parse_mountinfo(path):
     out = []
-    for fn in ("/proc/1/mountinfo", "/proc/self/mountinfo"):
-        try:
-            with open(fn, "r", encoding="utf-8") as f:
-                for line in f:
-                    p = line.strip().split()
-                    if len(p) < 10 or "-" not in p:
-                        continue
-                    i = p.index("-")
-                    out.append({"mount_point": dec(p[4]), "fs_type": p[i+1] if len(p)>i+1 else "", "source": dec(p[i+2]) if len(p)>i+2 else ""})
-            if out:
-                return out
-        except Exception:
-            pass
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 10 or "-" not in parts:
+                    continue
+                sep = parts.index("-")
+                mount_point = decode_path(parts[4])
+                fs_type = parts[sep + 1] if len(parts) > sep + 1 else ""
+                source = decode_path(parts[sep + 2]) if len(parts) > sep + 2 else ""
+                out.append({
+                    "mount_point": mount_point,
+                    "fs_type": fs_type,
+                    "source": source,
+                })
+    except Exception:
+        pass
     return out
 
-def is_net(m):
-    fs, src, mp = m.get("fs_type",""), m.get("source",""), m.get("mount_point","")
-    if not mp or mp == "/":
+def host_mounts():
+    mounts = parse_mountinfo("/proc/1/mountinfo")
+    if not mounts:
+        mounts = parse_mountinfo("/proc/self/mountinfo")
+    return mounts
+
+def is_network_mount(mount):
+    fs_type = mount.get("fs_type", "")
+    source = mount.get("source", "")
+    mount_point = mount.get("mount_point", "")
+
+    if not mount_point or mount_point == "/":
         return False
-    for pref in SKIP_PREFIXES:
-        if under(mp, pref):
+
+    for prefix in SKIP_PREFIXES:
+        if is_under(mount_point, prefix):
             return False
-    if fs in NETWORK_FS_TYPES:
+
+    if fs_type in NETWORK_FS_TYPES:
         return True
-    if fs.startswith("fuse.") and any(x in fs for x in ("rclone","sshfs","dav","webdav")):
+
+    if fs_type.startswith("fuse.") and any(x in fs_type for x in ("rclone", "sshfs", "dav", "webdav")):
         return True
-    if src.startswith("//"):
+
+    if source.startswith("//"):
         return True
-    if ":" in src and fs in ("nfs","nfs4","fuse.sshfs","sshfs"):
+
+    if ":" in source and fs_type in ("nfs", "nfs4", "fuse.sshfs", "sshfs"):
         return True
+
     return False
 
-def stat_card(name, cpath, kind, host="", source="", fs=""):
-    stp = os.stat(cpath)
-    st = os.statvfs(cpath)
+def name_from_path(path):
+    base = os.path.basename(path.rstrip("/")) or path
+    # Cosmetic: if the mount point got a duplicate suffix, keep path exact but make the card name cleaner.
+    return re.sub(r"\s+\(\d+\)$", "", base)
+
+def stat_card(name, host_path, kind, source="", fs_type=""):
+    path = container_path(host_path)
+    st_path = os.stat(path)
+    st = os.statvfs(path)
+
     total = st.f_blocks * st.f_frsize
     free = st.f_bavail * st.f_frsize
     used = total - free
-    return {"name": name, "kind": kind, "host_path": host, "source": source, "fs_type": fs,
-            "mounted": True, "device_id": stp.st_dev, "total_gb": gib(total),
-            "used_gb": gib(used), "free_gb": gib(free),
-            "percent": round((used / total) * 100, 1) if total else 0}
 
-def add_card(cards, seen_paths, seen_devs, card):
-    hp, dev = card.get("host_path",""), card.get("device_id")
-    if hp and hp in seen_paths:
+    return {
+        "name": name,
+        "kind": kind,
+        "host_path": host_path,
+        "path": path,
+        "source": source,
+        "fs_type": fs_type,
+        "mounted": True,
+        "device_id": st_path.st_dev,
+        "total_gb": gib(total),
+        "used_gb": gib(used),
+        "free_gb": gib(free),
+        "percent": round((used / total) * 100, 1) if total else 0,
+    }
+
+def add_unique(cards, seen_host_paths, seen_signatures, card):
+    host_path = card.get("host_path", "")
+    signature = (
+        card.get("kind", ""),
+        card.get("source", ""),
+        card.get("fs_type", ""),
+        card.get("device_id", ""),
+    )
+
+    if host_path and host_path in seen_host_paths:
         return
-    if dev is not None and dev in seen_devs:
+
+    # For external/network disks, avoid same storage duplicated by bind/alias,
+    # but do not hide system just because it may share device with a folder.
+    if card.get("kind") in ("external", "network") and signature in seen_signatures:
         return
+
     cards.append(card)
-    if hp: seen_paths.add(hp)
-    if dev is not None: seen_devs.add(dev)
 
-def name_from_path(p):
-    return os.path.basename(p.rstrip("/")) or p
+    if host_path:
+        seen_host_paths.add(host_path)
 
-def data():
-    cards, hidden, seen_paths, seen_devs = [], [], set(), set()
-    mnts = mounts()
+    if card.get("kind") in ("external", "network"):
+        seen_signatures.add(signature)
 
-    try:
-        add_card(cards, seen_paths, seen_devs, stat_card("UMBREL_DATA", SYSTEM_PATH, "system", HOST_UMBREL_ROOT))
-    except Exception as e:
-        cards.append({"name":"UMBREL_DATA","kind":"system","host_path":HOST_UMBREL_ROOT,"mounted":False,"error":str(e)})
-
-    ext_mounts = [m for m in mnts if m["mount_point"] != HOST_EXTERNAL_ROOT and under(m["mount_point"], HOST_EXTERNAL_ROOT)]
-    ext_hosts = set(m["mount_point"] for m in ext_mounts)
-
-    for m in sorted(ext_mounts, key=lambda x: x["mount_point"]):
-        if is_net(m):
+def external_mounts(mounts):
+    result = []
+    for mount in mounts:
+        mount_point = mount.get("mount_point", "")
+        if not mount_point:
             continue
-        mp = m["mount_point"]
-        try:
-            add_card(cards, seen_paths, seen_devs, stat_card(name_from_path(mp), host_path(mp), "external", mp, m.get("source",""), m.get("fs_type","")))
-        except Exception as e:
-            cards.append({"name":name_from_path(mp),"kind":"external","host_path":mp,"source":m.get("source",""),"fs_type":m.get("fs_type",""),"mounted":False,"error":str(e)})
+        if mount_point == HOST_EXTERNAL_ROOT:
+            continue
+        if is_under(mount_point, HOST_EXTERNAL_ROOT):
+            result.append(mount)
+
+    result.sort(key=lambda x: x.get("mount_point", ""))
+    return result
+
+def visible_external_mounts(mounts):
+    result = []
+    for mount in external_mounts(mounts):
+        if is_network_mount(mount):
+            continue
+        mount_point = mount["mount_point"]
+        path = container_path(mount_point)
+        if not os.path.ismount(path):
+            # Important: ordinary directories in external are not disks.
+            continue
+        result.append(mount)
+    return result
+
+def hidden_external_folders(mounts):
+    hidden = []
+    mounted_paths = set(m["mount_point"] for m in external_mounts(mounts))
+    ext_container = container_path(HOST_EXTERNAL_ROOT)
 
     try:
-        ext_dir = host_path(HOST_EXTERNAL_ROOT)
-        if os.path.isdir(ext_dir):
-            for d in sorted(os.listdir(ext_dir)):
-                hp = HOST_EXTERNAL_ROOT.rstrip("/") + "/" + d
-                cp = os.path.join(ext_dir, d)
-                if os.path.isdir(cp) and hp not in ext_hosts:
-                    hidden.append(d)
+        if os.path.isdir(ext_container):
+            for name in sorted(os.listdir(ext_container)):
+                host_path = HOST_EXTERNAL_ROOT + "/" + name
+                path = os.path.join(ext_container, name)
+
+                if os.path.isdir(path) and host_path not in mounted_paths:
+                    hidden.append(name)
     except Exception:
         pass
 
-    for m in sorted([x for x in mnts if is_net(x)], key=lambda x: x["mount_point"]):
-        mp = m["mount_point"]
-        try:
-            add_card(cards, seen_paths, seen_devs, stat_card(name_from_path(mp), host_path(mp), "network", mp, m.get("source",""), m.get("fs_type","")))
-        except Exception as e:
-            cards.append({"name":name_from_path(mp),"kind":"network","host_path":mp,"source":m.get("source",""),"fs_type":m.get("fs_type",""),"mounted":False,"error":str(e)})
+    return hidden
 
-    return {"disks": cards, "hidden_unmounted_external_folders": hidden, "updated_at": int(time.time())}
+def get_data():
+    cards = []
+    seen_host_paths = set()
+    seen_signatures = set()
+    mounts = host_mounts()
+
+    try:
+        system_card = {
+            **stat_card("UMBREL_DATA", HOST_UMBREL_ROOT, "system"),
+            "path": SYSTEM_PATH,
+        }
+        add_unique(cards, seen_host_paths, seen_signatures, system_card)
+    except Exception as err:
+        cards.append({
+            "name": "UMBREL_DATA",
+            "kind": "system",
+            "host_path": HOST_UMBREL_ROOT,
+            "mounted": False,
+            "error": str(err),
+        })
+
+    for mount in visible_external_mounts(mounts):
+        mount_point = mount["mount_point"]
+        try:
+            card = stat_card(
+                name_from_path(mount_point),
+                mount_point,
+                "external",
+                source=mount.get("source", ""),
+                fs_type=mount.get("fs_type", ""),
+            )
+            add_unique(cards, seen_host_paths, seen_signatures, card)
+        except Exception as err:
+            cards.append({
+                "name": name_from_path(mount_point),
+                "kind": "external",
+                "host_path": mount_point,
+                "source": mount.get("source", ""),
+                "fs_type": mount.get("fs_type", ""),
+                "mounted": False,
+                "error": str(err),
+            })
+
+    for mount in sorted([m for m in mounts if is_network_mount(m)], key=lambda x: x.get("mount_point", "")):
+        mount_point = mount["mount_point"]
+        path = container_path(mount_point)
+
+        try:
+            if not os.path.exists(path):
+                continue
+
+            card = stat_card(
+                name_from_path(mount_point),
+                mount_point,
+                "network",
+                source=mount.get("source", ""),
+                fs_type=mount.get("fs_type", ""),
+            )
+            add_unique(cards, seen_host_paths, seen_signatures, card)
+        except Exception as err:
+            cards.append({
+                "name": name_from_path(mount_point),
+                "kind": "network",
+                "host_path": mount_point,
+                "source": mount.get("source", ""),
+                "fs_type": mount.get("fs_type", ""),
+                "mounted": False,
+                "error": str(err),
+            })
+
+    return {
+        "disks": cards,
+        "hidden_unmounted_external_folders": hidden_external_folders(mounts),
+        "updated_at": int(time.time()),
+        "app_version": "1.3.1",
+    }
 
 HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Disk Status</title><style>
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at top,#1e293b,#020617 70%);color:#e5e7eb}.wrap{max-width:1180px;margin:34px auto;padding:0 20px 40px}h1{font-size:36px;margin:0 0 8px;letter-spacing:-.03em}.sub{color:#94a3b8;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px}.card{background:rgba(15,23,42,.92);border:1px solid #243244;border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(0,0,0,.35)}.top{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin-bottom:14px}.name{font-size:22px;font-weight:800;word-break:break-word}.badge{display:inline-block;margin-top:6px;color:#93c5fd;font-size:12px;font-weight:700;letter-spacing:.02em;text-transform:uppercase}.source{color:#64748b;font-size:12px;margin-top:10px;overflow-wrap:anywhere;line-height:1.35}.percent{font-size:34px;font-weight:900;white-space:nowrap}.bar{height:20px;border-radius:999px;background:#1f2937;overflow:hidden;margin:16px 0;border:1px solid #334155}.fill{height:100%;width:0;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444);border-radius:999px;transition:width .35s ease}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.stat{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px}.label{color:#94a3b8;font-size:13px;margin-bottom:5px}.value{font-size:18px;font-weight:800}.error{color:#f87171;font-weight:800;word-break:break-word}.footer{margin-top:18px;color:#64748b;font-size:13px;line-height:1.45}.hidden{margin-top:6px;color:#94a3b8}@media(max-width:800px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr}.top{flex-direction:column}}</style></head><body>
@@ -148,20 +296,34 @@ function t(v){return v===undefined||v===null?"":String(v)}
 function kind(d){if(d.kind==="system")return"system / data";if(d.kind==="network")return d.fs_type?"network "+d.fs_type:"network";return"external mounted"}
 function src(d){let p=[];if(d.source)p.push("source: "+t(d.source));if(d.host_path)p.push("path: "+t(d.host_path));return '<div class="source">'+p.join(" · ")+'</div>'}
 function card(d){if(d.error)return '<div class="card"><div class="name">'+t(d.name)+'</div><div class="badge">'+kind(d)+'</div><p class="error">'+t(d.error)+'</p>'+src(d)+'</div>';return '<div class="card"><div class="top"><div><div class="name">'+t(d.name)+'</div><div class="badge">'+kind(d)+'</div></div><div class="percent">'+t(d.percent)+'%</div></div><div class="bar"><div class="fill" style="width:'+t(d.percent)+'%"></div></div><div class="stats"><div class="stat"><div class="label">Занято</div><div class="value">'+t(d.used_gb)+' GB</div></div><div class="stat"><div class="label">Свободно</div><div class="value">'+t(d.free_gb)+' GB</div></div><div class="stat"><div class="label">Всего</div><div class="value">'+t(d.total_gb)+' GB</div></div></div>'+src(d)+'</div>'}
-async function load(){try{const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});const d=await r.json();let html="";d.disks.forEach(x=>html+=card(x));document.getElementById("app").innerHTML='<div class="grid">'+html+'</div>';let f='Последнее обновление: '+new Date().toLocaleString();if(d.hidden_unmounted_external_folders&&d.hidden_unmounted_external_folders.length)f+='<div class="hidden">Скрыты обычные папки без mount: '+d.hidden_unmounted_external_folders.join(", ")+'</div>';document.getElementById("updated").innerHTML=f}catch(e){document.getElementById("app").innerHTML='<div class="card"><p class="error">'+String(e)+'</p></div>'}}
+async function load(){try{const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});const d=await r.json();let html="";d.disks.forEach(x=>html+=card(x));document.getElementById("app").innerHTML='<div class="grid">'+html+'</div>';let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version);if(d.hidden_unmounted_external_folders&&d.hidden_unmounted_external_folders.length)f+='<div class="hidden">Скрыты обычные папки без mount: '+d.hidden_unmounted_external_folders.join(", ")+'</div>';document.getElementById("updated").innerHTML=f}catch(e){document.getElementById("app").innerHTML='<div class="card"><p class="error">'+String(e)+'</p></div>'}}
 load();setInterval(load,5000)
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        p = self.path.split("?", 1)[0].rstrip("/")
-        if p == "":
-            b = HTML.encode("utf-8")
-            self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
-        if p == "/api/disks":
-            b = json.dumps(data(), ensure_ascii=False).encode("utf-8")
-            self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
-        self.send_response(404); self.end_headers()
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "":
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/disks":
+            body = json.dumps(get_data(), ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def log_message(self, *args):
         return
 
