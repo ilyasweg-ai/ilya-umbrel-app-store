@@ -1,7 +1,9 @@
+version: "3.7"
+
 services:
   app_proxy:
     environment:
-      APP_HOST: server
+      APP_HOST: ilya-disk-status_server_1
       APP_PORT: 8080
 
   server:
@@ -11,11 +13,11 @@ services:
     stop_grace_period: 1m
     volumes:
       - type: bind
-        source: /home/umbrel/umbrel/external/ssd990_main
+        source: ${UMBREL_ROOT}/external/ssd990_main
         target: /disks/ssd990_main
         read_only: true
       - type: bind
-        source: /home/umbrel/umbrel/external/backup_umbrel_hdd
+        source: ${UMBREL_ROOT}/external/backup_umbrel_hdd
         target: /disks/backup_umbrel_hdd
         read_only: true
     command:
