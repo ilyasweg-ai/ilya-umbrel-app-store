@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.6.1"
+        APP_VERSION = "1.6.2"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -967,7 +967,7 @@ services:
             return {
                 "disks": disks,
                 "updated_at": now_ts(),
-                "live_interval_ms": 500,
+                "live_interval_ms": 1000,
             }
 
 
@@ -1287,7 +1287,7 @@ services:
         <body>
         <div class="wrap">
           <h1>Disk Status</h1>
-          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждые 0.5 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждую 1 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
           <div class="toolbar" id="filters"></div>
           <div id="app">Загрузка...</div>
           <div class="footer" id="updated"></div>
@@ -1420,7 +1420,7 @@ services:
               '<div><div class="label">Device</div><div class="ioVal utilVal">'+(d.io_device||"—")+'</div></div>'+
             '</div>';
           }
-          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждые ~0.5 сек">'+
+          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждую ~1 сек">'+
             '<div><div class="label">Чтение</div><div class="ioVal readVal">'+t(d.read_mbps)+' MB/s</div></div>'+
             '<div><div class="label">Запись</div><div class="ioVal writeVal">'+t(d.write_mbps)+' MB/s</div></div>'+
             '<div><div class="label">I/O util</div><div class="ioVal utilVal">'+t(d.io_util_percent)+'%</div></div>'+
@@ -1525,7 +1525,7 @@ services:
             allDisks=d.disks||[];
             latestHistoryStats=d.history_stats||null;
             render();
-            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 0.5 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 1 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
             if(d.history_stats){
               f+=' · база истории: '+t(d.history_stats.db_size_mb)+' MB · записей: '+t(d.history_stats.total_rows);
             }
@@ -1745,7 +1745,7 @@ services:
         load();
         setTimeout(loadLiveIo,700);
         setInterval(load,5000);
-        setInterval(loadLiveIo,500);
+        setInterval(loadLiveIo,1000);
         setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},2000);
         </script>
         </body>
