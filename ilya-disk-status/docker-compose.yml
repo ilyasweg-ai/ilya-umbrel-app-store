@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.6.0"
+        APP_VERSION = "1.6.1"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -68,8 +68,7 @@ services:
         last_sample_ts = 0
         last_compact_ts = 0
         latest_payload = None
-        prev_diskstats = {}
-        prev_diskstats_ts = None
+        prev_io_states = {}
 
 
         def now_ts():
@@ -332,14 +331,16 @@ services:
             return os.path.basename(source)
 
 
-        def compute_io_rates():
-            global prev_diskstats, prev_diskstats_ts
-
+        def compute_io_rates(reader="sampler"):
             current = read_diskstats()
             ts = time.time()
             rates = {}
 
             with io_lock:
+                state = prev_io_states.get(reader, {})
+                prev_diskstats = state.get("stats")
+                prev_diskstats_ts = state.get("ts")
+
                 if prev_diskstats and prev_diskstats_ts:
                     dt = max(0.001, ts - prev_diskstats_ts)
 
@@ -362,16 +363,16 @@ services:
                             "read_iops": round(reads_delta / dt, 1),
                             "write_iops": round(writes_delta / dt, 1),
                             "io_util_percent": round(min(100, io_ms_delta / (dt * 10)), 1),
+                            "interval_sec": round(dt, 3),
                         }
 
-                prev_diskstats = current
-                prev_diskstats_ts = ts
+                prev_io_states[reader] = {"stats": current, "ts": ts}
 
             return rates
 
 
-        def attach_io(cards):
-            rates = compute_io_rates()
+        def attach_io(cards, reader="sampler"):
+            rates = compute_io_rates(reader)
 
             for card in cards:
                 source = card.get("source", "")
@@ -388,6 +389,7 @@ services:
                         "read_iops": 0,
                         "write_iops": 0,
                         "io_util_percent": 0,
+                        "interval_sec": 0,
                     })
 
             return cards
@@ -929,6 +931,46 @@ services:
             return make_payload()
 
 
+
+        def get_live_io_data():
+            with cache_lock:
+                cached = latest_payload
+
+            if not cached:
+                cached = get_current_data()
+
+            rates = compute_io_rates("live")
+            disks = []
+
+            for card in cached.get("disks", []):
+                key = card.get("key", "")
+                source = card.get("source", "")
+                dev = source_to_device_name(source)
+                item = {
+                    "key": key,
+                    "name": card.get("name", ""),
+                    "io_device": dev,
+                    "io_available": False,
+                    "read_mbps": 0,
+                    "write_mbps": 0,
+                    "read_iops": 0,
+                    "write_iops": 0,
+                    "io_util_percent": 0,
+                    "interval_sec": 0,
+                }
+
+                if dev and dev in rates:
+                    item.update(rates[dev])
+
+                disks.append(item)
+
+            return {
+                "disks": disks,
+                "updated_at": now_ts(),
+                "live_interval_ms": 500,
+            }
+
+
         def allowed_scan_paths():
             cards, _ = collect_disks()
             allowed = {}
@@ -1245,7 +1287,7 @@ services:
         <body>
         <div class="wrap">
           <h1>Disk Status</h1>
-          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждые 0.5 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
           <div class="toolbar" id="filters"></div>
           <div id="app">Загрузка...</div>
           <div class="footer" id="updated"></div>
@@ -1369,14 +1411,19 @@ services:
         }
 
         function ioHtml(d){
+          const key=t(d.key);
           if(!d.io_available){
             const reason = d.kind==="network" ? "для сетевых mount сейчас недоступно" : "нет block device";
-            return '<div class="ioBox ioOff"><div><div class="label">I/O</div><div class="ioVal">—</div></div><div><div class="label">Статус</div><div class="ioVal">'+reason+'</div></div><div><div class="label">Device</div><div class="ioVal">'+(d.io_device||"—")+'</div></div></div>';
+            return '<div class="ioBox ioOff" data-io-key="'+key+'" title="Live I/O обновляется отдельно от карточек">'+
+              '<div><div class="label">I/O</div><div class="ioVal readVal">—</div></div>'+
+              '<div><div class="label">Статус</div><div class="ioVal writeVal">'+reason+'</div></div>'+
+              '<div><div class="label">Device</div><div class="ioVal utilVal">'+(d.io_device||"—")+'</div></div>'+
+            '</div>';
           }
-          return '<div class="ioBox">'+
-            '<div><div class="label">Чтение</div><div class="ioVal">'+t(d.read_mbps)+' MB/s</div></div>'+
-            '<div><div class="label">Запись</div><div class="ioVal">'+t(d.write_mbps)+' MB/s</div></div>'+
-            '<div><div class="label">I/O util</div><div class="ioVal">'+t(d.io_util_percent)+'%</div></div>'+
+          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждые ~0.5 сек">'+
+            '<div><div class="label">Чтение</div><div class="ioVal readVal">'+t(d.read_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">Запись</div><div class="ioVal writeVal">'+t(d.write_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">I/O util</div><div class="ioVal utilVal">'+t(d.io_util_percent)+'%</div></div>'+
           '</div>';
         }
 
@@ -1433,6 +1480,44 @@ services:
           bindCardButtons();
         }
 
+        async function loadLiveIo(){
+          try{
+            const r=await fetch('api/live?ts='+Date.now(),{cache:'no-store'});
+            const d=await r.json();
+            const items=d.disks||[];
+            items.forEach(function(io){
+              let box=null;
+              document.querySelectorAll(".ioBox").forEach(function(el){
+                if(el.dataset.ioKey===io.key)box=el;
+              });
+              if(!box)return;
+
+              const read=box.querySelector(".readVal");
+              const write=box.querySelector(".writeVal");
+              const util=box.querySelector(".utilVal");
+
+              if(io.io_available){
+                box.classList.remove("ioOff");
+                if(read)read.textContent=t(io.read_mbps)+" MB/s";
+                if(write)write.textContent=t(io.write_mbps)+" MB/s";
+                if(util)util.textContent=t(io.io_util_percent)+"%";
+                box.title="Live I/O: обновлено "+new Date().toLocaleTimeString()+" · интервал "+t(io.interval_sec)+" сек.";
+              }else{
+                box.classList.add("ioOff");
+              }
+
+              const cached=allDisks.find(function(x){return x.key===io.key});
+              if(cached){
+                cached.read_mbps=io.read_mbps;
+                cached.write_mbps=io.write_mbps;
+                cached.read_iops=io.read_iops;
+                cached.write_iops=io.write_iops;
+                cached.io_util_percent=io.io_util_percent;
+              }
+            });
+          }catch(e){}
+        }
+
         async function load(){
           try{
             const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});
@@ -1440,7 +1525,7 @@ services:
             allDisks=d.disks||[];
             latestHistoryStats=d.history_stats||null;
             render();
-            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · policy: 1s/24h, 10s/7d, 60s/30d';
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 0.5 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
             if(d.history_stats){
               f+=' · база истории: '+t(d.history_stats.db_size_mb)+' MB · записей: '+t(d.history_stats.total_rows);
             }
@@ -1658,8 +1743,10 @@ services:
         }
 
         load();
+        setTimeout(loadLiveIo,700);
         setInterval(load,5000);
-        setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},5000);
+        setInterval(loadLiveIo,500);
+        setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},2000);
         </script>
         </body>
         </html>"""
@@ -1696,6 +1783,10 @@ services:
 
                 if path == "/api/history":
                     self.send_json(history_data(query))
+                    return
+
+                if path == "/api/live":
+                    self.send_json(get_live_io_data())
                     return
 
                 if path == "/api/history/clear":
