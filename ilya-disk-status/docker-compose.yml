@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.6.3"
+        APP_VERSION = "1.6.4"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -70,6 +70,8 @@ services:
         latest_payload = None
         prev_io_states = {}
         io_window_states = {}
+        prev_fs_states = {}
+        fs_window_states = {}
         IO_SMOOTH_WINDOW_SEC = 8
 
 
@@ -204,6 +206,9 @@ services:
                 "fs_type": fs_type,
                 "mounted": True,
                 "device_id": st_path.st_dev,
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
                 "total_gb": gib(total),
                 "used_gb": gib(used),
                 "free_gb": gib(free),
@@ -404,33 +409,136 @@ services:
             return rates
 
 
+        def compute_fs_growth_rates(cards, reader="sampler"):
+            ts = time.time()
+            rates = {}
+
+            with io_lock:
+                prev = prev_fs_states.get(reader, {})
+                windows = fs_window_states.setdefault(reader, {})
+
+                for card in cards:
+                    key = card.get("key")
+                    if not key or not card.get("mounted") or card.get("error"):
+                        continue
+
+                    used_bytes = card.get("used_bytes")
+                    if used_bytes is None:
+                        continue
+
+                    old = prev.get(key)
+                    if old:
+                        dt = max(0.001, ts - old.get("ts", ts))
+                        delta = used_bytes - old.get("used_bytes", used_bytes)
+
+                        # This is what looks like copy/upload speed in Umbrel Files or Windows:
+                        # occupied filesystem space growth per second.
+                        file_write_raw = max(0, delta) / dt / 1048576
+                        file_delete_raw = max(0, -delta) / dt / 1048576
+
+                        window = windows.setdefault(key, [])
+                        window.append((ts, file_write_raw, file_delete_raw))
+                        cutoff = ts - IO_SMOOTH_WINDOW_SEC
+                        while window and window[0][0] < cutoff:
+                            window.pop(0)
+
+                        if window:
+                            file_write = sum(x[1] for x in window) / len(window)
+                            file_delete = sum(x[2] for x in window) / len(window)
+                        else:
+                            file_write = 0
+                            file_delete = 0
+
+                        rates[key] = {
+                            "file_write_mbps": round(file_write, 3),
+                            "file_write_mbps_raw": round(file_write_raw, 3),
+                            "file_delete_mbps": round(file_delete, 3),
+                            "fs_interval_sec": round(dt, 3),
+                            "fs_smooth_samples": len(window),
+                        }
+
+                    prev[key] = {"used_bytes": used_bytes, "ts": ts}
+
+                prev_fs_states[reader] = prev
+
+            return rates
+
+
         def attach_io(cards, reader="sampler"):
-            rates = compute_io_rates(reader)
+            block_rates = compute_io_rates(reader)
+            fs_rates = compute_fs_growth_rates(cards, reader)
 
             for card in cards:
                 source = card.get("source", "")
                 dev = source_to_device_name(source)
+                block = block_rates.get(dev) if dev else None
+                fs = fs_rates.get(card.get("key"), {})
 
-                if dev and dev in rates:
-                    card.update(rates[dev])
+                file_write = fs.get("file_write_mbps", 0)
+
+                if block:
+                    block_read = block.get("read_mbps", 0)
+                    block_write = block.get("write_mbps", 0)
+
+                    # User-facing write speed:
+                    # When occupied space is growing, this matches Umbrel/Windows copy progress better.
+                    # If not growing, fallback to real block-device writeback.
+                    if file_write >= 0.05:
+                        shown_write = file_write
+                        write_mode = "copy/files"
+                    else:
+                        shown_write = block_write
+                        write_mode = "disk/block"
+
+                    card.update({
+                        "io_device": dev,
+                        "io_available": True,
+                        "read_mbps": round(block_read, 3),
+                        "write_mbps": round(shown_write, 3),
+                        "write_mode": write_mode,
+                        "block_read_mbps": round(block_read, 3),
+                        "block_write_mbps": round(block_write, 3),
+                        "file_write_mbps": round(file_write, 3),
+                        "file_write_mbps_raw": fs.get("file_write_mbps_raw", 0),
+                        "file_delete_mbps": fs.get("file_delete_mbps", 0),
+                        "read_iops": block.get("read_iops", 0),
+                        "write_iops": block.get("write_iops", 0),
+                        "io_util_percent": block.get("io_util_percent", 0),
+                        "raw_read_mbps": block.get("raw_read_mbps", 0),
+                        "raw_write_mbps": block.get("raw_write_mbps", 0),
+                        "raw_io_util_percent": block.get("raw_io_util_percent", 0),
+                        "interval_sec": block.get("interval_sec", 0),
+                        "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
+                        "smooth_samples": block.get("smooth_samples", 0),
+                        "fs_interval_sec": fs.get("fs_interval_sec", 0),
+                        "fs_smooth_samples": fs.get("fs_smooth_samples", 0),
+                    })
                 else:
                     card.update({
                         "io_device": dev,
                         "io_available": False,
                         "read_mbps": 0,
-                        "write_mbps": 0,
+                        "write_mbps": round(file_write, 3),
+                        "write_mode": "copy/files" if file_write >= 0.05 else "none",
+                        "block_read_mbps": 0,
+                        "block_write_mbps": 0,
+                        "file_write_mbps": round(file_write, 3),
+                        "file_write_mbps_raw": fs.get("file_write_mbps_raw", 0),
+                        "file_delete_mbps": fs.get("file_delete_mbps", 0),
                         "read_iops": 0,
                         "write_iops": 0,
                         "io_util_percent": 0,
                         "interval_sec": 0,
                         "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
                         "smooth_samples": 0,
+                        "fs_interval_sec": fs.get("fs_interval_sec", 0),
+                        "fs_smooth_samples": fs.get("fs_smooth_samples", 0),
                     })
 
             return cards
 
 
-        def collect_disks():
+        def collect_disks(reader="sampler"):
             cards = []
             seen_host_paths = set()
             seen_signatures = set()
@@ -507,7 +615,7 @@ services:
                         "error": str(err),
                     })
 
-            attach_io(cards)
+            attach_io(cards, reader)
             return cards, hidden_external_folders(mounts)
 
 
@@ -799,7 +907,7 @@ services:
 
 
         def make_payload():
-            cards, hidden = collect_disks()
+            cards, hidden = collect_disks("sampler")
             save_sample(cards)
             compact_history(False)
             add_state_to_cards(cards)
@@ -1003,48 +1111,41 @@ services:
 
 
         def get_live_io_data():
-            with cache_lock:
-                cached = latest_payload
-
-            if not cached:
-                cached = get_current_data()
-
-            rates = compute_io_rates("live")
+            cards, _ = collect_disks("live")
             disks = []
 
-            for card in cached.get("disks", []):
-                key = card.get("key", "")
-                source = card.get("source", "")
-                dev = source_to_device_name(source)
-                item = {
-                    "key": key,
+            for card in cards:
+                disks.append({
+                    "key": card.get("key", ""),
                     "name": card.get("name", ""),
-                    "io_device": dev,
-                    "io_available": False,
-                    "read_mbps": 0,
-                    "write_mbps": 0,
-                    "read_iops": 0,
-                    "write_iops": 0,
-                    "io_util_percent": 0,
-                    "interval_sec": 0,
-                        "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
-                        "smooth_samples": 0,
-                }
-
-                if dev and dev in rates:
-                    item.update(rates[dev])
-
-                disks.append(item)
+                    "io_device": card.get("io_device", ""),
+                    "io_available": card.get("io_available", False),
+                    "read_mbps": card.get("read_mbps", 0),
+                    "write_mbps": card.get("write_mbps", 0),
+                    "write_mode": card.get("write_mode", "none"),
+                    "block_read_mbps": card.get("block_read_mbps", 0),
+                    "block_write_mbps": card.get("block_write_mbps", 0),
+                    "file_write_mbps": card.get("file_write_mbps", 0),
+                    "file_write_mbps_raw": card.get("file_write_mbps_raw", 0),
+                    "file_delete_mbps": card.get("file_delete_mbps", 0),
+                    "read_iops": card.get("read_iops", 0),
+                    "write_iops": card.get("write_iops", 0),
+                    "io_util_percent": card.get("io_util_percent", 0),
+                    "interval_sec": card.get("interval_sec", 0),
+                    "fs_interval_sec": card.get("fs_interval_sec", 0),
+                    "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
+                })
 
             return {
                 "disks": disks,
                 "updated_at": now_ts(),
                 "live_interval_ms": 1000,
+                "write_display": "filesystem-growth-preferred",
             }
 
 
         def allowed_scan_paths():
-            cards, _ = collect_disks()
+            cards, _ = collect_disks("scan")
             allowed = {}
             for card in cards:
                 if card.get("mounted") and not card.get("error") and card.get("host_path"):
@@ -1359,7 +1460,7 @@ services:
         <body>
         <div class="wrap">
           <h1>Disk Status</h1>
-          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждую 1 сек и сглаживается за 8 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live запись считается по росту занятого места, поэтому ближе к скорости копирования в Umbrel/Windows; сглаживание 8 сек.</div>
           <div class="toolbar" id="filters"></div>
           <div id="app">Загрузка...</div>
           <div class="footer" id="updated"></div>
@@ -1492,7 +1593,7 @@ services:
               '<div><div class="label">Device</div><div class="ioVal utilVal">'+(d.io_device||"—")+'</div></div>'+
             '</div>';
           }
-          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждую ~1 сек; показано сглаженное среднее за ~8 сек">'+
+          return '<div class="ioBox" data-io-key="'+key+'" title="Запись: при копировании показывается рост занятого места, ближе к Umbrel/Windows; fallback — block I/O. Сглаживание ~8 сек">'+
             '<div><div class="label">Чтение</div><div class="ioVal readVal">'+t(d.read_mbps)+' MB/s</div></div>'+
             '<div><div class="label">Запись</div><div class="ioVal writeVal">'+t(d.write_mbps)+' MB/s</div></div>'+
             '<div><div class="label">I/O util</div><div class="ioVal utilVal">'+t(d.io_util_percent)+'%</div></div>'+
@@ -1573,7 +1674,7 @@ services:
                 if(read)read.textContent=t(io.read_mbps)+" MB/s";
                 if(write)write.textContent=t(io.write_mbps)+" MB/s";
                 if(util)util.textContent=t(io.io_util_percent)+"%";
-                box.title="Live I/O: обновлено "+new Date().toLocaleTimeString()+" · сглаживание "+t(io.smooth_window_sec || 8)+" сек. · raw interval "+t(io.interval_sec)+" сек.";
+                box.title="Live I/O: "+new Date().toLocaleTimeString()+" · режим записи: "+t(io.write_mode)+" · files "+t(io.file_write_mbps)+" MB/s · block "+t(io.block_write_mbps)+" MB/s · сглаживание "+t(io.smooth_window_sec || 8)+" сек.";
               }else{
                 box.classList.add("ioOff");
               }
@@ -1582,6 +1683,9 @@ services:
               if(cached){
                 cached.read_mbps=io.read_mbps;
                 cached.write_mbps=io.write_mbps;
+                cached.write_mode=io.write_mode;
+                cached.block_write_mbps=io.block_write_mbps;
+                cached.file_write_mbps=io.file_write_mbps;
                 cached.read_iops=io.read_iops;
                 cached.write_iops=io.write_iops;
                 cached.io_util_percent=io.io_util_percent;
@@ -1597,7 +1701,7 @@ services:
             allDisks=d.disks||[];
             latestHistoryStats=d.history_stats||null;
             render();
-            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 1 сек / сглаживание 8 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live запись ближе к Umbrel/Windows · сглаживание 8 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
             if(d.history_stats){
               f+=' · база истории: '+t(d.history_stats.db_size_mb)+' MB · записей: '+t(d.history_stats.total_rows);
             }
