@@ -1,13 +1,13 @@
 manifestVersion: 1
 id: ilya-disk-status
 name: Disk Status
-tagline: Disk usage, history and live I/O dashboard
+tagline: Disk usage, tiered history and live I/O dashboard
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-disk-status/icon.svg
 category: files
-version: "1.5.1"
+version: "1.6.0"
 port: 8080
 description: >-
-  Simple page showing used and free space for Umbrel system/data storage, mounted external disks, network mounts, disk usage history, live disk read/write I/O, and top folders.
+  Simple page showing used and free space for Umbrel system/data storage, mounted external disks, network mounts, tiered disk usage history, live disk read/write I/O, and top folders.
 developer: Ilya
 website: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 submitter: Ilya
@@ -16,7 +16,7 @@ repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Hotfix: fixed frontend JavaScript escaping bug that caused the page to stay on Loading in 1.5.0.
+  Added tiered history storage: 1 second for 24 hours, 10 seconds for 7 days, 1 minute for 30 days. Added history database size stats, per-disk estimated history size, clear history button with confirmation, and preserved live disk I/O dashboard.
 dependencies: []
 path: ""
 defaultUsername: ""

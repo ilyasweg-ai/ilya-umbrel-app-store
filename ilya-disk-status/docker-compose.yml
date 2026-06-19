@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.5.1"
+        APP_VERSION = "1.6.0"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -35,8 +35,16 @@ services:
 
         DATA_DIR = "/data"
         DB_PATH = DATA_DIR + "/history.sqlite"
+
+        # Tiered history:
+        # raw samples: every 1 sec, keep 24 hours
+        # 10 sec samples: keep 7 days
+        # 60 sec samples: keep 30 days
         SAMPLE_INTERVAL_SEC = 1
-        RETENTION_DAYS = 14
+        RAW_KEEP_SEC = 24 * 3600
+        TIER10_KEEP_SEC = 7 * 24 * 3600
+        TIER60_KEEP_SEC = 30 * 24 * 3600
+        COMPACT_INTERVAL_SEC = 60
         DEFAULT_TOP_SCAN_TIMEOUT_SEC = 25
 
         NETWORK_FS_TYPES = {
@@ -58,6 +66,7 @@ services:
 
         top_jobs = {}
         last_sample_ts = 0
+        last_compact_ts = 0
         latest_payload = None
         prev_diskstats = {}
         prev_diskstats_ts = None
@@ -88,6 +97,10 @@ services:
 
         def gib(value):
             return round(value / 1073741824, 1)
+
+
+        def mib(value):
+            return round(value / 1048576, 2)
 
 
         def disk_key(kind, host_path, source=""):
@@ -461,38 +474,50 @@ services:
             return cards, hidden_external_folders(mounts)
 
 
+        def sample_columns_sql():
+            return """
+                ts integer not null,
+                disk_key text not null,
+                name text,
+                kind text,
+                host_path text,
+                source text,
+                fs_type text,
+                total_gb real,
+                used_gb real,
+                free_gb real,
+                percent real,
+                read_mbps real,
+                write_mbps real,
+                read_iops real,
+                write_iops real,
+                io_util_percent real
+            """
+
+
+        def ensure_table_columns(conn, table_name):
+            existing_cols = {row[1] for row in conn.execute(f"pragma table_info({table_name})").fetchall()}
+            wanted = [
+                ("read_mbps", "real"),
+                ("write_mbps", "real"),
+                ("read_iops", "real"),
+                ("write_iops", "real"),
+                ("io_util_percent", "real"),
+            ]
+            for col, col_type in wanted:
+                if col not in existing_cols:
+                    conn.execute(f"alter table {table_name} add column {col} {col_type}")
+
+
         def init_db():
             os.makedirs(DATA_DIR, exist_ok=True)
             with db_lock:
                 conn = sqlite3.connect(DB_PATH)
-                conn.execute("""
-                    create table if not exists samples (
-                        ts integer not null,
-                        disk_key text not null,
-                        name text,
-                        kind text,
-                        host_path text,
-                        source text,
-                        fs_type text,
-                        total_gb real,
-                        used_gb real,
-                        free_gb real,
-                        percent real
-                    )
-                """)
+                for table_name in ("samples", "samples_10s", "samples_60s"):
+                    conn.execute(f"create table if not exists {table_name} ({sample_columns_sql()})")
+                    ensure_table_columns(conn, table_name)
+                    conn.execute(f"create index if not exists idx_{table_name}_key_ts on {table_name}(disk_key, ts)")
 
-                existing_cols = {row[1] for row in conn.execute("pragma table_info(samples)").fetchall()}
-                for col, col_type in [
-                    ("read_mbps", "real"),
-                    ("write_mbps", "real"),
-                    ("read_iops", "real"),
-                    ("write_iops", "real"),
-                    ("io_util_percent", "real"),
-                ]:
-                    if col not in existing_cols:
-                        conn.execute(f"alter table samples add column {col} {col_type}")
-
-                conn.execute("create index if not exists idx_samples_key_ts on samples(disk_key, ts)")
                 conn.execute("""
                     create table if not exists disk_state (
                         disk_key text primary key,
@@ -510,8 +535,33 @@ services:
                         last_percent real
                     )
                 """)
+
+                conn.execute("""
+                    create table if not exists app_meta (
+                        key text primary key,
+                        value text
+                    )
+                """)
                 conn.commit()
                 conn.close()
+
+
+        def insert_sample_row(conn, table_name, ts, card):
+            conn.execute(
+                f"""
+                insert into {table_name}
+                (ts,disk_key,name,kind,host_path,source,fs_type,total_gb,used_gb,free_gb,percent,read_mbps,write_mbps,read_iops,write_iops,io_util_percent)
+                values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ts, card.get("key"), card.get("name"), card.get("kind"), card.get("host_path"),
+                    card.get("source"), card.get("fs_type"), card.get("total_gb"),
+                    card.get("used_gb"), card.get("free_gb"), card.get("percent"),
+                    card.get("read_mbps", 0), card.get("write_mbps", 0),
+                    card.get("read_iops", 0), card.get("write_iops", 0),
+                    card.get("io_util_percent", 0),
+                )
+            )
 
 
         def save_sample(cards):
@@ -555,21 +605,7 @@ services:
                         if not changed:
                             last_changed = row[1] or ts
 
-                    conn.execute(
-                        """
-                        insert into samples
-                        (ts,disk_key,name,kind,host_path,source,fs_type,total_gb,used_gb,free_gb,percent,read_mbps,write_mbps,read_iops,write_iops,io_util_percent)
-                        values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (
-                            ts, key, card.get("name"), card.get("kind"), card.get("host_path"),
-                            card.get("source"), card.get("fs_type"), card.get("total_gb"),
-                            card.get("used_gb"), card.get("free_gb"), card.get("percent"),
-                            card.get("read_mbps", 0), card.get("write_mbps", 0),
-                            card.get("read_iops", 0), card.get("write_iops", 0),
-                            card.get("io_util_percent", 0),
-                        )
-                    )
+                    insert_sample_row(conn, "samples", ts, card)
 
                     conn.execute(
                         """
@@ -596,8 +632,67 @@ services:
                         )
                     )
 
-                cutoff = ts - RETENTION_DAYS * 86400
-                conn.execute("delete from samples where ts < ?", (cutoff,))
+                conn.commit()
+                conn.close()
+
+
+        def aggregate_into(conn, src_table, dst_table, bucket_sec, start_ts, end_ts):
+            # Insert one averaged point per disk/bucket, and replace duplicates by deleting the bucket range first.
+            conn.execute(f"delete from {dst_table} where ts>=? and ts<?", (start_ts, end_ts))
+            conn.execute(
+                f"""
+                insert into {dst_table}
+                (ts,disk_key,name,kind,host_path,source,fs_type,total_gb,used_gb,free_gb,percent,read_mbps,write_mbps,read_iops,write_iops,io_util_percent)
+                select
+                    (ts / ?) * ? as bucket_ts,
+                    disk_key,
+                    max(name),
+                    max(kind),
+                    max(host_path),
+                    max(source),
+                    max(fs_type),
+                    round(avg(total_gb), 1),
+                    round(avg(used_gb), 1),
+                    round(avg(free_gb), 1),
+                    round(avg(percent), 1),
+                    round(avg(coalesce(read_mbps, 0)), 3),
+                    round(avg(coalesce(write_mbps, 0)), 3),
+                    round(avg(coalesce(read_iops, 0)), 1),
+                    round(avg(coalesce(write_iops, 0)), 1),
+                    round(avg(coalesce(io_util_percent, 0)), 1)
+                from {src_table}
+                where ts>=? and ts<?
+                group by disk_key, bucket_ts
+                """,
+                (bucket_sec, bucket_sec, start_ts, end_ts)
+            )
+
+
+        def compact_history(force=False):
+            global last_compact_ts
+            ts = now_ts()
+            if not force and ts - last_compact_ts < COMPACT_INTERVAL_SEC:
+                return
+
+            last_compact_ts = ts
+
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+
+                raw_to = ts - RAW_KEEP_SEC
+                raw_from = max(0, raw_to - COMPACT_INTERVAL_SEC * 3)
+                if raw_to > 0:
+                    aggregate_into(conn, "samples", "samples_10s", 10, raw_from, raw_to)
+
+                ten_to = ts - TIER10_KEEP_SEC
+                ten_from = max(0, ten_to - COMPACT_INTERVAL_SEC * 3)
+                if ten_to > 0:
+                    aggregate_into(conn, "samples_10s", "samples_60s", 60, ten_from, ten_to)
+
+                conn.execute("delete from samples where ts < ?", (ts - RAW_KEEP_SEC,))
+                conn.execute("delete from samples_10s where ts < ?", (ts - TIER10_KEEP_SEC,))
+                conn.execute("delete from samples_60s where ts < ?", (ts - TIER60_KEEP_SEC,))
+
                 conn.commit()
                 conn.close()
 
@@ -620,10 +715,63 @@ services:
             return cards
 
 
+        def db_stats():
+            size_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                counts = {}
+                total_rows = 0
+                for table_name in ("samples", "samples_10s", "samples_60s"):
+                    try:
+                        cnt = conn.execute(f"select count(*) from {table_name}").fetchone()[0]
+                    except Exception:
+                        cnt = 0
+                    counts[table_name] = cnt
+                    total_rows += cnt
+
+                per_disk_rows = {}
+                for table_name in ("samples", "samples_10s", "samples_60s"):
+                    try:
+                        rows = conn.execute(f"select disk_key,count(*) from {table_name} group by disk_key").fetchall()
+                        for key, cnt in rows:
+                            per_disk_rows[key] = per_disk_rows.get(key, 0) + cnt
+                    except Exception:
+                        pass
+
+                conn.close()
+
+            per_disk_mb = {}
+            for key, cnt in per_disk_rows.items():
+                est = (size_bytes * cnt / total_rows) if total_rows else 0
+                per_disk_mb[key] = mib(est)
+
+            return {
+                "db_size_bytes": size_bytes,
+                "db_size_mb": mib(size_bytes),
+                "total_rows": total_rows,
+                "counts": counts,
+                "per_disk_rows": per_disk_rows,
+                "per_disk_est_mb": per_disk_mb,
+                "policy": {
+                    "raw_1s_hours": 24,
+                    "tier_10s_days": 7,
+                    "tier_60s_days": 30,
+                },
+            }
+
+
         def make_payload():
             cards, hidden = collect_disks()
             save_sample(cards)
+            compact_history(False)
             add_state_to_cards(cards)
+
+            stats = db_stats()
+            for card in cards:
+                key = card.get("key")
+                card["history_rows"] = stats.get("per_disk_rows", {}).get(key, 0)
+                card["history_est_mb"] = stats.get("per_disk_est_mb", {}).get(key, 0)
 
             return {
                 "disks": cards,
@@ -631,7 +779,7 @@ services:
                 "updated_at": now_ts(),
                 "app_version": APP_VERSION,
                 "sample_interval_sec": SAMPLE_INTERVAL_SEC,
-                "retention_days": RETENTION_DAYS,
+                "history_stats": stats,
             }
 
 
@@ -661,6 +809,19 @@ services:
             return result
 
 
+        def query_history_rows(conn, table_name, disk, start_ts, end_ts):
+            params = [disk, start_ts, end_ts]
+            return conn.execute(
+                f"""
+                select ts, used_gb, free_gb, percent, read_mbps, write_mbps, io_util_percent
+                from {table_name}
+                where disk_key=? and ts>=? and ts<?
+                order by ts asc
+                """,
+                params
+            ).fetchall()
+
+
         def history_data(query):
             disk = query.get("disk", [""])[0]
             metric = query.get("metric", ["used_gb"])[0]
@@ -675,31 +836,42 @@ services:
             except Exception:
                 range_sec = 86400
 
-            where = "disk_key=?"
-            params = [disk]
+            ts = now_ts()
+            start_ts = 0 if range_sec <= 0 else ts - range_sec
 
-            if range_sec > 0:
-                cutoff = now_ts() - range_sec
-                where += " and ts>=?"
-                params.append(cutoff)
+            raw_start = max(start_ts, ts - RAW_KEEP_SEC)
+            ten_start = max(start_ts, ts - TIER10_KEEP_SEC)
+            ten_end = min(ts - RAW_KEEP_SEC, ts)
+            sixty_start = max(start_ts, ts - TIER60_KEEP_SEC)
+            sixty_end = min(ts - TIER10_KEEP_SEC, ts)
 
+            rows = []
             with db_lock:
                 conn = sqlite3.connect(DB_PATH)
-                rows = conn.execute(
-                    """
-                    select ts, used_gb, free_gb, percent, read_mbps, write_mbps, io_util_percent
-                    from samples
-                    where """ + where + " order by ts asc",
-                    params
-                ).fetchall()
+
+                if sixty_start < sixty_end:
+                    rows.extend(query_history_rows(conn, "samples_60s", disk, sixty_start, sixty_end))
+
+                if ten_start < ten_end:
+                    rows.extend(query_history_rows(conn, "samples_10s", disk, ten_start, ten_end))
+
+                if raw_start < ts + 1:
+                    rows.extend(query_history_rows(conn, "samples", disk, raw_start, ts + 1))
+
                 meta = conn.execute(
                     "select name,kind,host_path,source,fs_type from disk_state where disk_key=?",
                     (disk,)
                 ).fetchone()
                 conn.close()
 
+            rows.sort(key=lambda x: x[0])
+
             points = []
+            seen_ts = set()
             for row in rows:
+                if row[0] in seen_ts:
+                    continue
+                seen_ts.add(row[0])
                 points.append({
                     "ts": row[0],
                     "used_gb": row[1] or 0,
@@ -724,6 +896,26 @@ services:
                 },
                 "points": points,
                 "sample_interval_sec": SAMPLE_INTERVAL_SEC,
+                "policy": {
+                    "raw_1s_hours": 24,
+                    "tier_10s_days": 7,
+                    "tier_60s_days": 30,
+                },
+            }
+
+
+        def clear_history():
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                for table_name in ("samples", "samples_10s", "samples_60s", "disk_state"):
+                    conn.execute(f"delete from {table_name}")
+                conn.commit()
+                conn.execute("vacuum")
+                conn.close()
+
+            return {
+                "ok": True,
+                "history_stats": db_stats(),
             }
 
 
@@ -985,7 +1177,492 @@ services:
             return {"job_id": job_id, "cancel_requested": True}
 
 
-        HTML = "<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Disk Status</title>\n<style>\n*{box-sizing:border-box}\nbody{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;background:radial-gradient(circle at top,#1e293b,#020617 70%);color:#e5e7eb}\nbutton,select{font:inherit}\n.wrap{max-width:1220px;margin:34px auto;padding:0 20px 48px}\nh1{font-size:36px;margin:0 0 8px;letter-spacing:-.03em}\n.sub{color:#94a3b8;margin-bottom:18px}\n.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}\n.pill{border:1px solid #334155;background:#0f172a;color:#cbd5e1;border-radius:999px;padding:9px 13px;cursor:pointer}\n.pill.active{background:#2563eb;color:white;border-color:#60a5fa}\n.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(345px,1fr));gap:18px}\n.card{background:rgba(15,23,42,.92);border:1px solid #243244;border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(0,0,0,.35)}\n.top{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin-bottom:14px}\n.name{font-size:22px;font-weight:800;word-break:break-word}\n.badge{display:inline-block;margin-top:6px;color:#93c5fd;font-size:12px;font-weight:700;letter-spacing:.02em;text-transform:uppercase}\n.source{color:#64748b;font-size:12px;margin-top:10px;overflow-wrap:anywhere;line-height:1.35}\n.percent{font-size:34px;font-weight:900;white-space:nowrap}\n.bar{height:20px;border-radius:999px;background:linear-gradient(90deg,#22c55e 0%,#84cc16 45%,#eab308 70%,#f97316 88%,#ef4444 100%);overflow:hidden;margin:16px 0;border:1px solid #334155;position:relative}\n.mask{position:absolute;top:0;bottom:0;right:0;background:#1f2937;border-left:1px solid rgba(15,23,42,.25)}\n.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}\n.stat{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px}\n.label{color:#94a3b8;font-size:13px;margin-bottom:5px}\n.value{font-size:18px;font-weight:800}\n.ioBox{margin-top:12px;background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}\n.ioVal{font-weight:800;color:#bfdbfe;margin-top:3px}\n.ioOff{color:#64748b}\n.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}\n.btn{border:1px solid #334155;background:#020617;color:#dbeafe;border-radius:10px;padding:8px 10px;cursor:pointer}\n.btn:hover{background:#111827}\n.btn.danger{color:#fecaca;border-color:#7f1d1d}\n.mini{font-size:12px;color:#64748b;margin-top:10px;line-height:1.4}\n.error{color:#f87171;font-weight:800;word-break:break-word}\n.footer{margin-top:18px;color:#64748b;font-size:13px;line-height:1.45}\ndetails.hidden{margin-top:8px;color:#94a3b8}\ndetails.hidden summary{cursor:pointer;color:#cbd5e1}\n.overlay{position:fixed;inset:0;background:rgba(2,6,23,.82);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}\n.modal{width:min(1180px,96vw);max-height:92vh;overflow:auto;background:#0f172a;border:1px solid #334155;border-radius:22px;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.55)}\n.modalHead{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}\n.modalTitle{font-size:22px;font-weight:900}\n.close{border:1px solid #475569;background:#020617;color:white;border-radius:10px;padding:8px 12px;cursor:pointer}\n.chartControls,.scanControls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}\n.chartBox{height:540px;background:#020617;border:1px solid #1e293b;border-radius:16px;padding:10px;position:relative}\ncanvas{width:100%;height:100%;display:block}\n.table{width:100%;border-collapse:collapse;margin-top:12px}\n.table th,.table td{border-bottom:1px solid #1e293b;padding:10px;text-align:left}\n.table th{color:#93c5fd}\n.spinnerWrap{display:flex;align-items:center;gap:12px;margin:14px 0;color:#cbd5e1}\n.spinner{width:28px;height:28px;border-radius:50%;border:3px solid #1e293b;border-top-color:#60a5fa;animation:spin .8s linear infinite}\n@keyframes spin{to{transform:rotate(360deg)}}\n.progress{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;margin-top:10px}\n.pathNow{color:#94a3b8;overflow-wrap:anywhere;font-size:12px;margin-top:6px}\n.warnText{color:#fbbf24}\n.legend{display:flex;gap:12px;align-items:center;color:#94a3b8;font-size:12px;margin:2px 0 10px}\n.dot{width:10px;height:10px;border-radius:50%;display:inline-block}\n@media(max-width:800px){.grid{grid-template-columns:1fr}.stats,.ioBox{grid-template-columns:1fr}.top{flex-direction:column}.chartBox{height:420px}}\n</style>\n</head>\n<body>\n<div class=\"wrap\">\n  <h1>Disk Status</h1>\n  <div class=\"sub\">Системный раздел, реальные внешние диски и сетевые mount-диски. История и I/O пишутся каждую секунду. Карточки обновляются каждые 5 секунд.</div>\n  <div class=\"toolbar\" id=\"filters\"></div>\n  <div id=\"app\">Загрузка...</div>\n  <div class=\"footer\" id=\"updated\"></div>\n</div>\n\n<div class=\"overlay\" id=\"historyOverlay\">\n  <div class=\"modal\">\n    <div class=\"modalHead\">\n      <div>\n        <div class=\"modalTitle\" id=\"historyTitle\">История</div>\n        <div class=\"mini\" id=\"historyHint\">Колесо мыши — приблизить/отдалить. Зажать мышь и тянуть — двигать диапазон. Наведи мышкой на линию — увидишь точные значения.</div>\n      </div>\n      <button class=\"close\" onclick=\"closeHistory()\">Закрыть</button>\n    </div>\n    <div class=\"chartControls\">\n      <select id=\"metricSelect\" class=\"pill\" onchange=\"loadHistory()\">\n        <option value=\"used_gb\">Занято GB</option>\n        <option value=\"free_gb\">Свободно GB</option>\n        <option value=\"percent\">Процент %</option>\n        <option value=\"read_mbps\">Чтение MB/s</option>\n        <option value=\"write_mbps\">Запись MB/s</option>\n        <option value=\"io_util_percent\">I/O util %</option>\n      </select>\n      <button class=\"pill\" onclick=\"setRange(300)\">5м</button>\n      <button class=\"pill\" onclick=\"setRange(3600)\">1ч</button>\n      <button class=\"pill\" onclick=\"setRange(21600)\">6ч</button>\n      <button class=\"pill\" onclick=\"setRange(86400)\">24ч</button>\n      <button class=\"pill\" onclick=\"setRange(604800)\">7д</button>\n      <button class=\"pill\" onclick=\"setRange(0)\">Всё</button>\n      <button class=\"pill\" onclick=\"resetChartView()\">Сбросить</button>\n    </div>\n    <div class=\"legend\" id=\"ioLegend\" style=\"display:none\">\n      <span><span class=\"dot\" style=\"background:#60a5fa\"></span> чтение MB/s</span>\n      <span><span class=\"dot\" style=\"background:#f59e0b\"></span> запись MB/s</span>\n    </div>\n    <div class=\"chartBox\"><canvas id=\"historyCanvas\"></canvas></div>\n  </div>\n</div>\n\n<div class=\"overlay\" id=\"topOverlay\">\n  <div class=\"modal\">\n    <div class=\"modalHead\">\n      <div>\n        <div class=\"modalTitle\" id=\"topTitle\">Топ папок</div>\n        <div class=\"mini\">Сканирование read-only: данные не меняет, но может грузить диск/сеть. Для больших сетевых дисков лучше начать с 25–60 секунд.</div>\n      </div>\n      <button class=\"close\" onclick=\"closeTop()\">Закрыть</button>\n    </div>\n    <div class=\"scanControls\">\n      <select id=\"topTimeout\" class=\"pill\">\n        <option value=\"25\">Быстро — 25 сек</option>\n        <option value=\"60\">Нормально — 60 сек</option>\n        <option value=\"300\">Долго — 5 минут</option>\n        <option value=\"0\">Полный скан — без таймаута</option>\n      </select>\n      <button class=\"pill active\" onclick=\"startTopScan()\">Сканировать</button>\n      <button class=\"pill danger\" onclick=\"cancelTopScan()\">Отменить</button>\n    </div>\n    <div id=\"topBody\">Выбери режим и нажми “Сканировать”.</div>\n  </div>\n</div>\n\n<script>\nlet allDisks = [];\nlet activeFilter = \"all\";\nlet currentHistoryDisk = \"\";\nlet currentRange = 86400;\nlet historyPoints = [];\nlet viewStart = null;\nlet viewEnd = null;\nlet drag = null;\nlet hoverX = null;\nlet ioMode = false;\nlet currentTopPath = \"\";\nlet currentTopName = \"\";\nlet currentTopJob = \"\";\nlet topPollTimer = null;\n\nfunction t(v){return v===undefined||v===null?\"\":String(v)}\nfunction n(v){return Number(v)||0}\nfunction fmtTs(ts){if(!ts)return \"—\";return new Date(ts*1000).toLocaleString()}\nfunction kind(d){if(d.kind===\"system\")return\"system / data\";if(d.kind===\"network\")return d.fs_type?\"network \"+d.fs_type:\"network\";return\"external mounted\"}\nfunction sourceHtml(d){let p=[];if(d.source)p.push(\"source: \"+t(d.source));if(d.host_path)p.push(\"path: \"+t(d.host_path));return '<div class=\"source\">'+p.join(\" · \")+'</div>'}\nfunction copyText(x){navigator.clipboard.writeText(x).catch(function(){})}\nfunction metricLabel(metric){if(metric===\"free_gb\")return\"Свободно GB\";if(metric===\"percent\")return\"Процент %\";if(metric===\"read_mbps\")return\"Чтение MB/s\";if(metric===\"write_mbps\")return\"Запись MB/s\";if(metric===\"io_util_percent\")return\"I/O util %\";return\"Занято GB\"}\nfunction valOf(p,metric){return n(p[metric])}\n\nfunction renderFilters(){\n  const items=[[\"all\",\"Все\"],[\"system\",\"System\"],[\"external\",\"External\"],[\"network\",\"Network\"]];\n  let html=\"\";\n  items.forEach(function(i){\n    html+='<button class=\"pill '+(activeFilter===i[0]?\"active\":\"\")+'\" data-filter=\"'+i[0]+'\">'+i[1]+'</button>';\n  });\n  const box=document.getElementById(\"filters\");\n  box.innerHTML=html;\n  box.querySelectorAll(\"button[data-filter]\").forEach(function(btn){\n    btn.addEventListener(\"click\",function(){\n      activeFilter=this.dataset.filter;\n      render();\n    });\n  });\n}\n\nfunction ioHtml(d){\n  if(!d.io_available){\n    const reason = d.kind===\"network\" ? \"для сетевых mount сейчас недоступно\" : \"нет block device\";\n    return '<div class=\"ioBox ioOff\"><div><div class=\"label\">I/O</div><div class=\"ioVal\">—</div></div><div><div class=\"label\">Статус</div><div class=\"ioVal\">'+reason+'</div></div><div><div class=\"label\">Device</div><div class=\"ioVal\">'+(d.io_device||\"—\")+'</div></div></div>';\n  }\n  return '<div class=\"ioBox\">'+\n    '<div><div class=\"label\">Чтение</div><div class=\"ioVal\">'+t(d.read_mbps)+' MB/s</div></div>'+\n    '<div><div class=\"label\">Запись</div><div class=\"ioVal\">'+t(d.write_mbps)+' MB/s</div></div>'+\n    '<div><div class=\"label\">I/O util</div><div class=\"ioVal\">'+t(d.io_util_percent)+'%</div></div>'+\n  '</div>';\n}\n\nfunction enc(v){return encodeURIComponent(t(v))}\nfunction dec(v){try{return decodeURIComponent(v)}catch(e){return v}}\n\nfunction card(d){\n  if(d.error){\n    return '<div class=\"card\"><div class=\"name\">'+t(d.name)+'</div><div class=\"badge\">'+kind(d)+'</div><p class=\"error\">'+t(d.error)+'</p>'+sourceHtml(d)+'</div>';\n  }\n  const pct=Math.max(0,Math.min(100,Number(d.percent)||0));\n  return '<div class=\"card\">'+\n    '<div class=\"top\"><div><div class=\"name\">'+t(d.name)+'</div><div class=\"badge\">'+kind(d)+'</div></div><div class=\"percent\">'+t(d.percent)+'%</div></div>'+\n    '<div class=\"bar\"><div class=\"mask\" style=\"left:'+pct+'%\"></div></div>'+\n    '<div class=\"stats\">'+\n      '<div class=\"stat\"><div class=\"label\">Занято</div><div class=\"value\">'+t(d.used_gb)+' GB</div></div>'+\n      '<div class=\"stat\"><div class=\"label\">Свободно</div><div class=\"value\">'+t(d.free_gb)+' GB</div></div>'+\n      '<div class=\"stat\"><div class=\"label\">Всего</div><div class=\"value\">'+t(d.total_gb)+' GB</div></div>'+\n    '</div>'+ioHtml(d)+sourceHtml(d)+\n    '<div class=\"mini\">Первый раз: '+fmtTs(d.first_seen)+'<br>Последний раз виден: '+fmtTs(d.last_seen)+'<br>Последнее изменение: '+fmtTs(d.last_changed)+'</div>'+\n    '<div class=\"actions\">'+\n      '<button class=\"btn act-history\" data-key=\"'+enc(d.key)+'\" data-name=\"'+enc(d.name)+'\">История</button>'+\n      '<button class=\"btn act-io\" data-key=\"'+enc(d.key)+'\" data-name=\"'+enc(d.name)+'\">Live I/O</button>'+\n      '<button class=\"btn act-top\" data-path=\"'+enc(d.host_path)+'\" data-name=\"'+enc(d.name)+'\">Топ папок</button>'+\n      '<button class=\"btn act-copy\" data-path=\"'+enc(d.host_path)+'\">Copy path</button>'+\n    '</div></div>';\n}\n\nfunction attachDiskActions(){\n  document.querySelectorAll(\".act-history\").forEach(function(btn){btn.addEventListener(\"click\",function(){openHistory(dec(this.dataset.key),dec(this.dataset.name));});});\n  document.querySelectorAll(\".act-io\").forEach(function(btn){btn.addEventListener(\"click\",function(){openIo(dec(this.dataset.key),dec(this.dataset.name));});});\n  document.querySelectorAll(\".act-top\").forEach(function(btn){btn.addEventListener(\"click\",function(){openTop(this.dataset.path,dec(this.dataset.name));});});\n  document.querySelectorAll(\".act-copy\").forEach(function(btn){btn.addEventListener(\"click\",function(){copyText(dec(this.dataset.path));});});\n}\n\nfunction render(){\n  renderFilters();\n  let disks=allDisks.slice();\n  if(activeFilter!==\"all\")disks=disks.filter(function(d){return d.kind===activeFilter});\n  disks.sort(function(a,b){return (Number(b.percent)||0)-(Number(a.percent)||0)});\n  let html=\"\";\n  disks.forEach(function(d){html+=card(d)});\n  document.getElementById(\"app\").innerHTML='<div class=\"grid\">'+html+'</div>';\n  attachDiskActions();\n}\n\nasync function load(){\n  try{\n    const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});\n    const d=await r.json();\n    allDisks=d.disks||[];\n    render();\n    let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · запись истории/I/O каждые '+t(d.sample_interval_sec)+' сек. · хранение '+t(d.retention_days)+' дней';\n    if(d.hidden_unmounted_external_folders&&d.hidden_unmounted_external_folders.length){\n      f+='<details class=\"hidden\"><summary>Скрытые обычные папки без mount ('+d.hidden_unmounted_external_folders.length+')</summary>';\n      d.hidden_unmounted_external_folders.forEach(function(x){f+='<div>'+t(x.name)+' — '+t(x.host_path)+'</div>'});\n      f+='</details>';\n    }\n    document.getElementById(\"updated\").innerHTML=f;\n  }catch(e){\n    document.getElementById(\"app\").innerHTML='<div class=\"card\"><p class=\"error\">'+String(e)+'</p></div>';\n  }\n}\n\nfunction openHistory(key,name){\n  ioMode=false;\n  currentHistoryDisk=key;\n  currentRange=86400;\n  document.getElementById(\"historyTitle\").textContent=\"История: \"+name;\n  document.getElementById(\"historyOverlay\").style.display=\"flex\";\n  document.getElementById(\"metricSelect\").style.display=\"\";\n  document.getElementById(\"ioLegend\").style.display=\"none\";\n  viewStart=null;viewEnd=null;hoverX=null;\n  loadHistory();\n}\nfunction openIo(key,name){\n  ioMode=true;\n  currentHistoryDisk=key;\n  currentRange=300;\n  document.getElementById(\"historyTitle\").textContent=\"Live I/O: \"+name;\n  document.getElementById(\"historyOverlay\").style.display=\"flex\";\n  document.getElementById(\"metricSelect\").style.display=\"none\";\n  document.getElementById(\"ioLegend\").style.display=\"flex\";\n  viewStart=null;viewEnd=null;hoverX=null;\n  loadHistory();\n}\nfunction closeHistory(){document.getElementById(\"historyOverlay\").style.display=\"none\"}\nfunction setRange(sec){currentRange=sec;viewStart=null;viewEnd=null;loadHistory()}\nfunction resetChartView(){viewStart=null;viewEnd=null;hoverX=null;drawChart()}\n\nasync function loadHistory(){\n  if(!currentHistoryDisk)return;\n  const metric=ioMode ? \"read_mbps\" : document.getElementById(\"metricSelect\").value;\n  const r=await fetch('api/history?disk='+encodeURIComponent(currentHistoryDisk)+'&metric='+metric+'&range='+currentRange+'&ts='+Date.now(),{cache:'no-store'});\n  const d=await r.json();\n  historyPoints=d.points||[];\n  if(historyPoints.length){\n    if(viewStart===null)viewStart=historyPoints[0].ts*1000;\n    if(viewEnd===null)viewEnd=historyPoints[historyPoints.length-1].ts*1000;\n  }\n  drawChart();\n}\n\nfunction drawLine(ctx,pts,metric,x,y,color){\n  ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;\n  pts.forEach(function(p,i){let xx=x(p.ts*1000),yy=y(valOf(p,metric));if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});\n  ctx.stroke();\n}\n\nfunction roundRect(ctx,x,y,w,h,r){\n  ctx.beginPath();\n  ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);\n  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);\n  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);\n  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();\n}\n\nfunction drawChart(){\n  const canvas=document.getElementById(\"historyCanvas\");\n  const box=canvas.getBoundingClientRect();\n  canvas.width=Math.max(600,Math.floor(box.width*devicePixelRatio));\n  canvas.height=Math.max(360,Math.floor(box.height*devicePixelRatio));\n  const ctx=canvas.getContext(\"2d\");\n  ctx.scale(devicePixelRatio,devicePixelRatio);\n  const w=canvas.width/devicePixelRatio,h=canvas.height/devicePixelRatio;\n  ctx.clearRect(0,0,w,h);\n  ctx.fillStyle=\"#020617\";ctx.fillRect(0,0,w,h);\n  const padL=70,padR=18,padT=26,padB=50;\n  const pts=historyPoints.filter(function(p){const ms=p.ts*1000;return viewStart===null||ms>=viewStart&&ms<=viewEnd});\n  ctx.strokeStyle=\"#1e293b\";ctx.lineWidth=1;\n  for(let i=0;i<6;i++){let yy=padT+(h-padT-padB)*i/5;ctx.beginPath();ctx.moveTo(padL,yy);ctx.lineTo(w-padR,yy);ctx.stroke()}\n  if(!pts.length){ctx.fillStyle=\"#94a3b8\";ctx.fillText(\"Пока нет данных. Подожди несколько секунд.\",padL,padT+30);return}\n\n  const metrics = ioMode ? [\"read_mbps\",\"write_mbps\"] : [document.getElementById(\"metricSelect\").value];\n  let values=[];\n  pts.forEach(function(p){metrics.forEach(function(m){values.push(valOf(p,m))})});\n  let min=Math.min(...values),max=Math.max(...values);\n  if(min===max){min-=1;max+=1}\n  if(ioMode){min=0}\n\n  const x0=viewStart||pts[0].ts*1000,x1=viewEnd||pts[pts.length-1].ts*1000;\n  function x(ms){return padL+(ms-x0)/(x1-x0)*(w-padL-padR)}\n  function y(v){return h-padB-(v-min)/(max-min)*(h-padT-padB)}\n  ctx.fillStyle=\"#94a3b8\";ctx.font=\"12px system-ui\";\n  for(let i=0;i<6;i++){let val=min+(max-min)*(5-i)/5;let yy=padT+(h-padT-padB)*i/5;ctx.fillText(val.toFixed(1),8,yy+4)}\n  if(ioMode){\n    drawLine(ctx,pts,\"read_mbps\",x,y,\"#60a5fa\");\n    drawLine(ctx,pts,\"write_mbps\",x,y,\"#f59e0b\");\n    ctx.fillStyle=\"#cbd5e1\";ctx.fillText(\"MB/s\",padL,padT-8);\n  }else{\n    const metric=document.getElementById(\"metricSelect\").value;\n    drawLine(ctx,pts,metric,x,y,\"#60a5fa\");\n    ctx.fillStyle=\"#cbd5e1\";ctx.fillText(metricLabel(metric),padL,padT-8);\n  }\n\n  if(hoverX!==null && hoverX>=padL && hoverX<=w-padR){\n    const hoverMs=x0+(hoverX-padL)/(w-padL-padR)*(x1-x0);\n    let nearest=pts[0],best=Math.abs(pts[0].ts*1000-hoverMs);\n    pts.forEach(function(p){let diff=Math.abs(p.ts*1000-hoverMs);if(diff<best){best=diff;nearest=p}});\n    const hx=x(nearest.ts*1000);\n    ctx.strokeStyle=\"#64748b\";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(hx,padT);ctx.lineTo(hx,h-padB);ctx.stroke();\n    const boxW=244,boxH=112;\n    let bx=hx+12;if(bx+boxW>w-padR)bx=hx-boxW-12;\n    let by=padT+12;\n    ctx.fillStyle=\"rgba(15,23,42,.96)\";ctx.strokeStyle=\"#334155\";ctx.lineWidth=1;\n    roundRect(ctx,bx,by,boxW,boxH,10);ctx.fill();ctx.stroke();\n    ctx.fillStyle=\"#e5e7eb\";ctx.font=\"12px system-ui\";\n    ctx.fillText(new Date(nearest.ts*1000).toLocaleString(),bx+10,by+20);\n    ctx.fillStyle=\"#bfdbfe\";ctx.fillText(\"Занято: \"+n(nearest.used_gb).toFixed(1)+\" GB\",bx+10,by+40);\n    ctx.fillStyle=\"#bbf7d0\";ctx.fillText(\"Свободно: \"+n(nearest.free_gb).toFixed(1)+\" GB\",bx+10,by+58);\n    ctx.fillStyle=\"#fde68a\";ctx.fillText(\"Процент: \"+n(nearest.percent).toFixed(1)+\"%\",bx+10,by+76);\n    ctx.fillStyle=\"#93c5fd\";ctx.fillText(\"Чтение: \"+n(nearest.read_mbps).toFixed(3)+\" MB/s\",bx+10,by+94);\n    ctx.fillStyle=\"#fdba74\";ctx.fillText(\"Запись: \"+n(nearest.write_mbps).toFixed(3)+\" MB/s\",bx+122,by+94);\n  }\n\n  ctx.fillStyle=\"#cbd5e1\";\n  ctx.fillText(new Date(x0).toLocaleString(),padL,h-16);\n  ctx.textAlign=\"right\";ctx.fillText(new Date(x1).toLocaleString(),w-padR,h-16);ctx.textAlign=\"left\";\n}\n\nconst historyCanvas = document.getElementById(\"historyCanvas\");\nhistoryCanvas.addEventListener(\"mousemove\", function(e){\n  const rect=e.target.getBoundingClientRect();\n  hoverX=e.clientX-rect.left;\n  if(!drag)drawChart();\n});\nhistoryCanvas.addEventListener(\"mouseleave\", function(){\n  hoverX=null;\n  drawChart();\n});\nhistoryCanvas.addEventListener(\"wheel\",function(e){\n  e.preventDefault();\n  if(!historyPoints.length)return;\n  const rect=e.target.getBoundingClientRect();\n  const mx=(e.clientX-rect.left)/rect.width;\n  const start=viewStart,end=viewEnd,span=end-start;\n  const factor=e.deltaY<0?0.8:1.25;\n  const center=start+span*mx;\n  let ns=center-(center-start)*factor;\n  let ne=center+(end-center)*factor;\n  const allS=historyPoints[0].ts*1000,allE=historyPoints[historyPoints.length-1].ts*1000;\n  if(ns<allS)ns=allS;if(ne>allE)ne=allE;\n  if(ne-ns>1000){viewStart=ns;viewEnd=ne;drawChart()}\n},{passive:false});\nhistoryCanvas.addEventListener(\"mousedown\",function(e){\n  drag={x:e.clientX,start:viewStart,end:viewEnd};\n});\ndocument.addEventListener(\"mousemove\",function(e){\n  if(!drag||!historyPoints.length)return;\n  const rect=historyCanvas.getBoundingClientRect();\n  const dx=e.clientX-drag.x;\n  const span=drag.end-drag.start;\n  const shift=-dx/rect.width*span;\n  const allS=historyPoints[0].ts*1000,allE=historyPoints[historyPoints.length-1].ts*1000;\n  let ns=drag.start+shift,ne=drag.end+shift;\n  if(ns<allS){ne+=allS-ns;ns=allS}\n  if(ne>allE){ns-=ne-allE;ne=allE}\n  viewStart=ns;viewEnd=ne;drawChart();\n});\ndocument.addEventListener(\"mouseup\",function(){drag=null});\n\nfunction openTop(encodedPath,name){\n  currentTopPath=encodedPath;\n  currentTopName=name;\n  currentTopJob=\"\";\n  document.getElementById(\"topTitle\").textContent=\"Топ папок: \"+name;\n  document.getElementById(\"topOverlay\").style.display=\"flex\";\n  document.getElementById(\"topBody\").innerHTML='Выбери режим и нажми “Сканировать”.';\n}\nfunction closeTop(){\n  document.getElementById(\"topOverlay\").style.display=\"none\";\n  if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}\n}\nasync function startTopScan(){\n  if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}\n  const timeout=document.getElementById(\"topTimeout\").value;\n  document.getElementById(\"topBody\").innerHTML='<div class=\"spinnerWrap\"><div class=\"spinner\"></div><div>Запускаю сканирование...</div></div>';\n  const r=await fetch('api/top/start?host_path='+currentTopPath+'&limit=20&timeout='+encodeURIComponent(timeout)+'&ts='+Date.now(),{cache:'no-store'});\n  const d=await r.json();\n  if(d.error){document.getElementById(\"topBody\").innerHTML='<p class=\"error\">'+t(d.error)+'</p>';return}\n  currentTopJob=d.job_id;\n  topPollTimer=setInterval(pollTop,1000);\n  pollTop();\n}\nasync function cancelTopScan(){\n  if(!currentTopJob)return;\n  await fetch('api/top/cancel?job_id='+encodeURIComponent(currentTopJob)+'&ts='+Date.now(),{cache:'no-store'});\n}\nasync function pollTop(){\n  if(!currentTopJob)return;\n  const r=await fetch('api/top/status?job_id='+encodeURIComponent(currentTopJob)+'&ts='+Date.now(),{cache:'no-store'});\n  const d=await r.json();\n  renderTopStatus(d);\n  if(d.status===\"done\"||d.status===\"error\"||d.status===\"cancelled\"){\n    if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}\n  }\n}\nfunction renderTopStatus(d){\n  if(d.error){document.getElementById(\"topBody\").innerHTML='<p class=\"error\">'+t(d.error)+'</p>';return}\n  let html=\"\";\n  if(d.status===\"running\"||d.status===\"queued\"){\n    html+='<div class=\"spinnerWrap\"><div class=\"spinner\"></div><div><b>Сканирование идёт...</b><div class=\"pathNow\">Сейчас: '+t(d.current_path)+'</div></div></div>';\n  }\n  if(d.status===\"cancelled\")html+='<p class=\"warnText\">Сканирование отменено.</p>';\n  if(d.status===\"done\"&&d.timed_out){\n    html+='<p class=\"warnText\">Сканирование упёрлось в лимит '+t(d.timeout_sec)+' сек. Можно выбрать режим дольше или “Полный скан — без таймаута” и запустить заново.</p>';\n  }\n  if(d.status===\"done\"&&!d.timed_out)html+='<p>Готово.</p>';\n  html+='<div class=\"progress\">Просмотрено элементов: '+t(d.scanned_entries||0)+' · файлов: '+t(d.scanned_files||0)+' · ошибок доступа: '+t(d.errors||0)+'</div>';\n  const items=d.items||[];\n  html+='<table class=\"table\"><tr><th>Папка/файл</th><th>Тип</th><th>Размер</th><th>Путь</th></tr>';\n  items.forEach(function(x){html+='<tr><td>'+t(x.name)+'</td><td>'+t(x.type)+'</td><td>'+t(x.size_gb)+' GB</td><td>'+t(x.host_path)+'</td></tr>'});\n  html+='</table>';\n  document.getElementById(\"topBody\").innerHTML=html;\n}\n\nload();\nsetInterval(load,5000);\nsetInterval(function(){if(document.getElementById(\"historyOverlay\").style.display===\"flex\")loadHistory()},5000);\n</script>\n</body>\n</html>"
+        HTML = """<!doctype html>
+        <html lang="ru">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Disk Status</title>
+        <style>
+        *{box-sizing:border-box}
+        body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at top,#1e293b,#020617 70%);color:#e5e7eb}
+        button,select{font:inherit}
+        .wrap{max-width:1220px;margin:34px auto;padding:0 20px 48px}
+        h1{font-size:36px;margin:0 0 8px;letter-spacing:-.03em}
+        .sub{color:#94a3b8;margin-bottom:18px}
+        .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px;align-items:center}
+        .pill{border:1px solid #334155;background:#0f172a;color:#cbd5e1;border-radius:999px;padding:9px 13px;cursor:pointer}
+        .pill.active{background:#2563eb;color:white;border-color:#60a5fa}
+        .pill.danger{border-color:#7f1d1d;color:#fecaca}
+        .historyInfo{color:#94a3b8;font-size:13px}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(345px,1fr));gap:18px}
+        .card{background:rgba(15,23,42,.92);border:1px solid #243244;border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(0,0,0,.35)}
+        .top{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin-bottom:14px}
+        .name{font-size:22px;font-weight:800;word-break:break-word}
+        .badge{display:inline-block;margin-top:6px;color:#93c5fd;font-size:12px;font-weight:700;letter-spacing:.02em;text-transform:uppercase}
+        .source{color:#64748b;font-size:12px;margin-top:10px;overflow-wrap:anywhere;line-height:1.35}
+        .percent{font-size:34px;font-weight:900;white-space:nowrap}
+        .bar{height:20px;border-radius:999px;background:linear-gradient(90deg,#22c55e 0%,#84cc16 45%,#eab308 70%,#f97316 88%,#ef4444 100%);overflow:hidden;margin:16px 0;border:1px solid #334155;position:relative}
+        .mask{position:absolute;top:0;bottom:0;right:0;background:#1f2937;border-left:1px solid rgba(15,23,42,.25)}
+        .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+        .stat{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px}
+        .label{color:#94a3b8;font-size:13px;margin-bottom:5px}
+        .value{font-size:18px;font-weight:800}
+        .ioBox{margin-top:12px;background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+        .ioVal{font-weight:800;color:#bfdbfe;margin-top:3px}
+        .ioOff{color:#64748b}
+        .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+        .btn{border:1px solid #334155;background:#020617;color:#dbeafe;border-radius:10px;padding:8px 10px;cursor:pointer}
+        .btn:hover{background:#111827}
+        .btn.danger{color:#fecaca;border-color:#7f1d1d}
+        .mini{font-size:12px;color:#64748b;margin-top:10px;line-height:1.4}
+        .error{color:#f87171;font-weight:800;word-break:break-word}
+        .footer{margin-top:18px;color:#64748b;font-size:13px;line-height:1.45}
+        details.hidden{margin-top:8px;color:#94a3b8}
+        details.hidden summary{cursor:pointer;color:#cbd5e1}
+        .overlay{position:fixed;inset:0;background:rgba(2,6,23,.82);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}
+        .modal{width:min(1180px,96vw);max-height:92vh;overflow:auto;background:#0f172a;border:1px solid #334155;border-radius:22px;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+        .modalHead{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}
+        .modalTitle{font-size:22px;font-weight:900}
+        .close{border:1px solid #475569;background:#020617;color:white;border-radius:10px;padding:8px 12px;cursor:pointer}
+        .chartControls,.scanControls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+        .chartBox{height:540px;background:#020617;border:1px solid #1e293b;border-radius:16px;padding:10px;position:relative}
+        canvas{width:100%;height:100%;display:block}
+        .table{width:100%;border-collapse:collapse;margin-top:12px}
+        .table th,.table td{border-bottom:1px solid #1e293b;padding:10px;text-align:left}
+        .table th{color:#93c5fd}
+        .spinnerWrap{display:flex;align-items:center;gap:12px;margin:14px 0;color:#cbd5e1}
+        .spinner{width:28px;height:28px;border-radius:50%;border:3px solid #1e293b;border-top-color:#60a5fa;animation:spin .8s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .progress{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;margin-top:10px}
+        .pathNow{color:#94a3b8;overflow-wrap:anywhere;font-size:12px;margin-top:6px}
+        .warnText{color:#fbbf24}
+        .legend{display:flex;gap:12px;align-items:center;color:#94a3b8;font-size:12px;margin:2px 0 10px}
+        .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+        @media(max-width:800px){.grid{grid-template-columns:1fr}.stats,.ioBox{grid-template-columns:1fr}.top{flex-direction:column}.chartBox{height:420px}}
+        </style>
+        </head>
+        <body>
+        <div class="wrap">
+          <h1>Disk Status</h1>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
+          <div class="toolbar" id="filters"></div>
+          <div id="app">Загрузка...</div>
+          <div class="footer" id="updated"></div>
+        </div>
+
+        <div class="overlay" id="historyOverlay">
+          <div class="modal">
+            <div class="modalHead">
+              <div>
+                <div class="modalTitle" id="historyTitle">История</div>
+                <div class="mini" id="historyHint">Колесо мыши — приблизить/отдалить. Зажать мышь и тянуть — двигать диапазон. Наведи мышкой на линию — увидишь точные значения.</div>
+              </div>
+              <button class="close" onclick="closeHistory()">Закрыть</button>
+            </div>
+            <div class="chartControls">
+              <select id="metricSelect" class="pill" onchange="loadHistory()">
+                <option value="used_gb">Занято GB</option>
+                <option value="free_gb">Свободно GB</option>
+                <option value="percent">Процент %</option>
+                <option value="read_mbps">Чтение MB/s</option>
+                <option value="write_mbps">Запись MB/s</option>
+                <option value="io_util_percent">I/O util %</option>
+              </select>
+              <button class="pill" onclick="setRange(300)">5м</button>
+              <button class="pill" onclick="setRange(3600)">1ч</button>
+              <button class="pill" onclick="setRange(21600)">6ч</button>
+              <button class="pill" onclick="setRange(86400)">24ч</button>
+              <button class="pill" onclick="setRange(604800)">7д</button>
+              <button class="pill" onclick="setRange(2592000)">30д</button>
+              <button class="pill" onclick="setRange(0)">Всё</button>
+              <button class="pill" onclick="resetChartView()">Сбросить</button>
+            </div>
+            <div class="legend" id="ioLegend" style="display:none">
+              <span><span class="dot" style="background:#60a5fa"></span> чтение MB/s</span>
+              <span><span class="dot" style="background:#f59e0b"></span> запись MB/s</span>
+            </div>
+            <div class="chartBox"><canvas id="historyCanvas"></canvas></div>
+          </div>
+        </div>
+
+        <div class="overlay" id="topOverlay">
+          <div class="modal">
+            <div class="modalHead">
+              <div>
+                <div class="modalTitle" id="topTitle">Топ папок</div>
+                <div class="mini">Сканирование read-only: данные не меняет, но может грузить диск/сеть. Для больших сетевых дисков лучше начать с 25–60 секунд.</div>
+              </div>
+              <button class="close" onclick="closeTop()">Закрыть</button>
+            </div>
+            <div class="scanControls">
+              <select id="topTimeout" class="pill">
+                <option value="25">Быстро — 25 сек</option>
+                <option value="60">Нормально — 60 сек</option>
+                <option value="300">Долго — 5 минут</option>
+                <option value="0">Полный скан — без таймаута</option>
+              </select>
+              <button class="pill active" onclick="startTopScan()">Сканировать</button>
+              <button class="pill danger" onclick="cancelTopScan()">Отменить</button>
+            </div>
+            <div id="topBody">Выбери режим и нажми “Сканировать”.</div>
+          </div>
+        </div>
+
+        <script>
+        let allDisks = [];
+        let activeFilter = "all";
+        let currentHistoryDisk = "";
+        let currentRange = 86400;
+        let historyPoints = [];
+        let viewStart = null;
+        let viewEnd = null;
+        let drag = null;
+        let hoverX = null;
+        let ioMode = false;
+        let currentTopPath = "";
+        let currentTopName = "";
+        let currentTopJob = "";
+        let topPollTimer = null;
+        let latestHistoryStats = null;
+
+        function t(v){return v===undefined||v===null?"":String(v)}
+        function n(v){return Number(v)||0}
+        function fmtTs(ts){if(!ts)return "—";return new Date(ts*1000).toLocaleString()}
+        function kind(d){if(d.kind==="system")return"system / data";if(d.kind==="network")return d.fs_type?"network "+d.fs_type:"network";return"external mounted"}
+        function sourceHtml(d){let p=[];if(d.source)p.push("source: "+t(d.source));if(d.host_path)p.push("path: "+t(d.host_path));return '<div class="source">'+p.join(" · ")+'</div>'}
+        function copyText(x){navigator.clipboard.writeText(x).catch(function(){})}
+        function metricLabel(metric){if(metric==="free_gb")return"Свободно GB";if(metric==="percent")return"Процент %";if(metric==="read_mbps")return"Чтение MB/s";if(metric==="write_mbps")return"Запись MB/s";if(metric==="io_util_percent")return"I/O util %";return"Занято GB"}
+        function valOf(p,metric){return n(p[metric])}
+
+        function renderFilters(){
+          const items=[["all","Все"],["system","System"],["external","External"],["network","Network"]];
+          let html="";
+          items.forEach(function(i){
+            html+='<button class="pill '+(activeFilter===i[0]?"active":"")+'" data-filter="'+i[0]+'">'+i[1]+'</button>';
+          });
+          const totalMb = latestHistoryStats ? t(latestHistoryStats.db_size_mb) : "0";
+          const rows = latestHistoryStats ? t(latestHistoryStats.total_rows) : "0";
+          html+='<button class="pill danger" id="clearHistoryBtn" title="История всех дисков занимает примерно '+totalMb+' MB, записей: '+rows+'">Очистить историю</button>';
+          html+='<span class="historyInfo" title="raw 1s: 24ч; compact 10s: 7д; compact 60s: 30д">История: '+totalMb+' MB · '+rows+' записей</span>';
+          document.getElementById("filters").innerHTML=html;
+          document.querySelectorAll("[data-filter]").forEach(function(btn){
+            btn.addEventListener("click",function(){activeFilter=btn.dataset.filter;render()});
+          });
+          const clearBtn=document.getElementById("clearHistoryBtn");
+          if(clearBtn)clearBtn.addEventListener("click",clearHistory);
+        }
+
+        async function clearHistory(){
+          const totalMb = latestHistoryStats ? latestHistoryStats.db_size_mb : 0;
+          const rows = latestHistoryStats ? latestHistoryStats.total_rows : 0;
+          const ok = confirm("Точно стереть всю историю дисков?\\n\\nБудет удалено примерно: "+totalMb+" MB\\nЗаписей: "+rows+"\\n\\nТекущие карточки дисков останутся, но графики начнутся заново.");
+          if(!ok)return;
+          const r=await fetch("api/history/clear?ts="+Date.now(),{cache:"no-store"});
+          const d=await r.json();
+          if(d.ok){
+            alert("История очищена.");
+            load();
+          }else{
+            alert("Не получилось очистить историю.");
+          }
+        }
+
+        function ioHtml(d){
+          if(!d.io_available){
+            const reason = d.kind==="network" ? "для сетевых mount сейчас недоступно" : "нет block device";
+            return '<div class="ioBox ioOff"><div><div class="label">I/O</div><div class="ioVal">—</div></div><div><div class="label">Статус</div><div class="ioVal">'+reason+'</div></div><div><div class="label">Device</div><div class="ioVal">'+(d.io_device||"—")+'</div></div></div>';
+          }
+          return '<div class="ioBox">'+
+            '<div><div class="label">Чтение</div><div class="ioVal">'+t(d.read_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">Запись</div><div class="ioVal">'+t(d.write_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">I/O util</div><div class="ioVal">'+t(d.io_util_percent)+'%</div></div>'+
+          '</div>';
+        }
+
+        function card(d){
+          if(d.error){
+            return '<div class="card"><div class="name">'+t(d.name)+'</div><div class="badge">'+kind(d)+'</div><p class="error">'+t(d.error)+'</p>'+sourceHtml(d)+'</div>';
+          }
+          const pct=Math.max(0,Math.min(100,Number(d.percent)||0));
+          const histTitle='История этого диска: примерно '+t(d.history_est_mb||0)+' MB, записей: '+t(d.history_rows||0);
+          return '<div class="card" data-key="'+t(d.key)+'">'+
+            '<div class="top"><div><div class="name">'+t(d.name)+'</div><div class="badge">'+kind(d)+'</div></div><div class="percent">'+t(d.percent)+'%</div></div>'+
+            '<div class="bar"><div class="mask" style="left:'+pct+'%"></div></div>'+
+            '<div class="stats">'+
+              '<div class="stat"><div class="label">Занято</div><div class="value">'+t(d.used_gb)+' GB</div></div>'+
+              '<div class="stat"><div class="label">Свободно</div><div class="value">'+t(d.free_gb)+' GB</div></div>'+
+              '<div class="stat"><div class="label">Всего</div><div class="value">'+t(d.total_gb)+' GB</div></div>'+
+            '</div>'+
+            ioHtml(d)+
+            sourceHtml(d)+
+            '<div class="mini">Первый раз: '+fmtTs(d.first_seen)+'<br>Последний раз виден: '+fmtTs(d.last_seen)+'<br>Последнее изменение: '+fmtTs(d.last_changed)+'<br>История диска: '+t(d.history_est_mb||0)+' MB · '+t(d.history_rows||0)+' записей</div>'+
+            '<div class="actions">'+
+              '<button class="btn historyBtn" title="'+histTitle+'">История</button>'+
+              '<button class="btn ioBtn">Live I/O</button>'+
+              '<button class="btn topBtn">Топ папок</button>'+
+              '<button class="btn copyBtn">Copy path</button>'+
+            '</div>'+
+          '</div>';
+        }
+
+        function bindCardButtons(){
+          document.querySelectorAll(".card").forEach(function(el){
+            const key=el.dataset.key;
+            const d=allDisks.find(function(x){return x.key===key});
+            if(!d)return;
+            const hist=el.querySelector(".historyBtn");
+            const io=el.querySelector(".ioBtn");
+            const top=el.querySelector(".topBtn");
+            const copy=el.querySelector(".copyBtn");
+            if(hist)hist.addEventListener("click",function(){openHistory(d.key,d.name)});
+            if(io)io.addEventListener("click",function(){openIo(d.key,d.name)});
+            if(top)top.addEventListener("click",function(){openTop(encodeURIComponent(t(d.host_path)),d.name)});
+            if(copy)copy.addEventListener("click",function(){copyText(t(d.host_path))});
+          });
+        }
+
+        function render(){
+          renderFilters();
+          let disks=allDisks.slice();
+          if(activeFilter!=="all")disks=disks.filter(function(d){return d.kind===activeFilter});
+          disks.sort(function(a,b){return (Number(b.percent)||0)-(Number(a.percent)||0)});
+          let html="";
+          disks.forEach(function(d){html+=card(d)});
+          document.getElementById("app").innerHTML='<div class="grid">'+html+'</div>';
+          bindCardButtons();
+        }
+
+        async function load(){
+          try{
+            const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});
+            const d=await r.json();
+            allDisks=d.disks||[];
+            latestHistoryStats=d.history_stats||null;
+            render();
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · policy: 1s/24h, 10s/7d, 60s/30d';
+            if(d.history_stats){
+              f+=' · база истории: '+t(d.history_stats.db_size_mb)+' MB · записей: '+t(d.history_stats.total_rows);
+            }
+            if(d.hidden_unmounted_external_folders&&d.hidden_unmounted_external_folders.length){
+              f+='<details class="hidden"><summary>Скрытые обычные папки без mount ('+d.hidden_unmounted_external_folders.length+')</summary>';
+              d.hidden_unmounted_external_folders.forEach(function(x){f+='<div>'+t(x.name)+' — '+t(x.host_path)+'</div>'});
+              f+='</details>';
+            }
+            document.getElementById("updated").innerHTML=f;
+          }catch(e){
+            document.getElementById("app").innerHTML='<div class="card"><p class="error">'+String(e)+'</p></div>';
+          }
+        }
+
+        function openHistory(key,name){
+          ioMode=false;
+          currentHistoryDisk=key;
+          currentRange=86400;
+          document.getElementById("historyTitle").textContent="История: "+name;
+          document.getElementById("historyOverlay").style.display="flex";
+          document.getElementById("metricSelect").style.display="";
+          document.getElementById("ioLegend").style.display="none";
+          viewStart=null;viewEnd=null;hoverX=null;
+          loadHistory();
+        }
+        function openIo(key,name){
+          ioMode=true;
+          currentHistoryDisk=key;
+          currentRange=300;
+          document.getElementById("historyTitle").textContent="Live I/O: "+name;
+          document.getElementById("historyOverlay").style.display="flex";
+          document.getElementById("metricSelect").style.display="none";
+          document.getElementById("ioLegend").style.display="flex";
+          viewStart=null;viewEnd=null;hoverX=null;
+          loadHistory();
+        }
+        function closeHistory(){document.getElementById("historyOverlay").style.display="none"}
+        function setRange(sec){currentRange=sec;viewStart=null;viewEnd=null;loadHistory()}
+        function resetChartView(){viewStart=null;viewEnd=null;hoverX=null;drawChart()}
+
+        async function loadHistory(){
+          if(!currentHistoryDisk)return;
+          const metric=ioMode ? "read_mbps" : document.getElementById("metricSelect").value;
+          const r=await fetch('api/history?disk='+encodeURIComponent(currentHistoryDisk)+'&metric='+metric+'&range='+currentRange+'&ts='+Date.now(),{cache:'no-store'});
+          const d=await r.json();
+          historyPoints=d.points||[];
+          if(historyPoints.length){
+            if(viewStart===null)viewStart=historyPoints[0].ts*1000;
+            if(viewEnd===null)viewEnd=historyPoints[historyPoints.length-1].ts*1000;
+          }
+          drawChart();
+        }
+
+        function drawLine(ctx,pts,metric,x,y,color){
+          ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
+          pts.forEach(function(p,i){let xx=x(p.ts*1000),yy=y(valOf(p,metric));if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});
+          ctx.stroke();
+        }
+
+        function drawChart(){
+          const canvas=document.getElementById("historyCanvas");
+          const box=canvas.getBoundingClientRect();
+          canvas.width=Math.max(600,Math.floor(box.width*devicePixelRatio));
+          canvas.height=Math.max(360,Math.floor(box.height*devicePixelRatio));
+          const ctx=canvas.getContext("2d");
+          ctx.scale(devicePixelRatio,devicePixelRatio);
+          const w=canvas.width/devicePixelRatio,h=canvas.height/devicePixelRatio;
+          ctx.clearRect(0,0,w,h);
+          ctx.fillStyle="#020617";ctx.fillRect(0,0,w,h);
+          const padL=70,padR=18,padT=26,padB=50;
+          const pts=historyPoints.filter(function(p){const ms=p.ts*1000;return viewStart===null||ms>=viewStart&&ms<=viewEnd});
+          ctx.strokeStyle="#1e293b";ctx.lineWidth=1;
+          for(let i=0;i<6;i++){let yy=padT+(h-padT-padB)*i/5;ctx.beginPath();ctx.moveTo(padL,yy);ctx.lineTo(w-padR,yy);ctx.stroke()}
+          if(!pts.length){ctx.fillStyle="#94a3b8";ctx.fillText("Пока нет данных. Подожди несколько секунд.",padL,padT+30);return}
+
+          const metrics = ioMode ? ["read_mbps","write_mbps"] : [document.getElementById("metricSelect").value];
+          let values=[];
+          pts.forEach(function(p){metrics.forEach(function(m){values.push(valOf(p,m))})});
+          let min=Math.min(...values),max=Math.max(...values);
+          if(min===max){min-=1;max+=1}
+          if(ioMode){min=0}
+
+          const x0=viewStart||pts[0].ts*1000,x1=viewEnd||pts[pts.length-1].ts*1000;
+          function x(ms){return padL+(ms-x0)/(x1-x0)*(w-padL-padR)}
+          function y(v){return h-padB-(v-min)/(max-min)*(h-padT-padB)}
+          ctx.fillStyle="#94a3b8";ctx.font="12px system-ui";
+          for(let i=0;i<6;i++){let val=min+(max-min)*(5-i)/5;let yy=padT+(h-padT-padB)*i/5;ctx.fillText(val.toFixed(1),8,yy+4)}
+          if(ioMode){
+            drawLine(ctx,pts,"read_mbps",x,y,"#60a5fa");
+            drawLine(ctx,pts,"write_mbps",x,y,"#f59e0b");
+            ctx.fillStyle="#cbd5e1";ctx.fillText("MB/s",padL,padT-8);
+          }else{
+            const metric=document.getElementById("metricSelect").value;
+            drawLine(ctx,pts,metric,x,y,"#60a5fa");
+            ctx.fillStyle="#cbd5e1";ctx.fillText(metricLabel(metric),padL,padT-8);
+          }
+
+          if(hoverX!==null){
+            const hoverMs=x0+(hoverX-padL)/(w-padL-padR)*(x1-x0);
+            let nearest=pts[0],best=Math.abs(pts[0].ts*1000-hoverMs);
+            pts.forEach(function(p){let diff=Math.abs(p.ts*1000-hoverMs);if(diff<best){best=diff;nearest=p}});
+            const hx=x(nearest.ts*1000);
+            ctx.strokeStyle="#64748b";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(hx,padT);ctx.lineTo(hx,h-padB);ctx.stroke();
+            const boxW=230,boxH=104;
+            let bx=hx+12;if(bx+boxW>w-padR)bx=hx-boxW-12;
+            let by=padT+12;
+            ctx.fillStyle="rgba(15,23,42,.96)";ctx.strokeStyle="#334155";ctx.lineWidth=1;
+            ctx.beginPath();ctx.roundRect(bx,by,boxW,boxH,10);ctx.fill();ctx.stroke();
+            ctx.fillStyle="#e5e7eb";ctx.font="12px system-ui";
+            ctx.fillText(new Date(nearest.ts*1000).toLocaleString(),bx+10,by+20);
+            ctx.fillStyle="#bfdbfe";ctx.fillText("Занято: "+n(nearest.used_gb).toFixed(1)+" GB",bx+10,by+40);
+            ctx.fillStyle="#bbf7d0";ctx.fillText("Свободно: "+n(nearest.free_gb).toFixed(1)+" GB",bx+10,by+58);
+            ctx.fillStyle="#fde68a";ctx.fillText("Процент: "+n(nearest.percent).toFixed(1)+"%",bx+10,by+76);
+            ctx.fillStyle="#93c5fd";ctx.fillText("R/W: "+n(nearest.read_mbps).toFixed(3)+" / "+n(nearest.write_mbps).toFixed(3)+" MB/s",bx+10,by+94);
+          }
+
+          ctx.fillStyle="#cbd5e1";
+          ctx.fillText(new Date(x0).toLocaleString(),padL,h-16);
+          ctx.textAlign="right";ctx.fillText(new Date(x1).toLocaleString(),w-padR,h-16);ctx.textAlign="left";
+        }
+
+        document.addEventListener("wheel",function(e){
+          if(document.getElementById("historyOverlay").style.display!=="flex")return;
+          if(e.target.id!=="historyCanvas")return;
+          e.preventDefault();
+          if(!historyPoints.length)return;
+          const rect=e.target.getBoundingClientRect();
+          const mx=(e.clientX-rect.left)/rect.width;
+          const start=viewStart,end=viewEnd,span=end-start;
+          const factor=e.deltaY<0?0.8:1.25;
+          const center=start+span*mx;
+          let ns=center-(center-start)*factor;
+          let ne=center+(end-center)*factor;
+          const allS=historyPoints[0].ts*1000,allE=historyPoints[historyPoints.length-1].ts*1000;
+          if(ns<allS)ns=allS;if(ne>allE)ne=allE;
+          if(ne-ns>1000){viewStart=ns;viewEnd=ne;drawChart()}
+        },{passive:false});
+        document.addEventListener("mousedown",function(e){
+          if(e.target.id==="historyCanvas")drag={x:e.clientX,start:viewStart,end:viewEnd};
+        });
+        document.addEventListener("mousemove",function(e){
+          if(document.getElementById("historyOverlay").style.display==="flex" && e.target.id==="historyCanvas"){
+            const rect=e.target.getBoundingClientRect();
+            hoverX=e.clientX-rect.left;
+          }
+          if(!drag||!historyPoints.length){drawChart();return}
+          const rect=document.getElementById("historyCanvas").getBoundingClientRect();
+          const dx=e.clientX-drag.x;
+          const span=drag.end-drag.start;
+          const shift=-dx/rect.width*span;
+          const allS=historyPoints[0].ts*1000,allE=historyPoints[historyPoints.length-1].ts*1000;
+          let ns=drag.start+shift,ne=drag.end+shift;
+          if(ns<allS){ne+=allS-ns;ns=allS}
+          if(ne>allE){ns-=ne-allE;ne=allE}
+          viewStart=ns;viewEnd=ne;drawChart();
+        });
+        document.addEventListener("mouseleave",function(e){
+          if(e.target && e.target.id==="historyCanvas"){hoverX=null;drawChart()}
+        });
+        document.addEventListener("mouseup",function(){drag=null});
+
+        function openTop(encodedPath,name){
+          currentTopPath=encodedPath;
+          currentTopName=name;
+          currentTopJob="";
+          document.getElementById("topTitle").textContent="Топ папок: "+name;
+          document.getElementById("topOverlay").style.display="flex";
+          document.getElementById("topBody").innerHTML='Выбери режим и нажми “Сканировать”.';
+        }
+        function closeTop(){
+          document.getElementById("topOverlay").style.display="none";
+          if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}
+        }
+        async function startTopScan(){
+          if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}
+          const timeout=document.getElementById("topTimeout").value;
+          document.getElementById("topBody").innerHTML='<div class="spinnerWrap"><div class="spinner"></div><div>Запускаю сканирование...</div></div>';
+          const r=await fetch('api/top/start?host_path='+currentTopPath+'&limit=20&timeout='+encodeURIComponent(timeout)+'&ts='+Date.now(),{cache:'no-store'});
+          const d=await r.json();
+          if(d.error){document.getElementById("topBody").innerHTML='<p class="error">'+t(d.error)+'</p>';return}
+          currentTopJob=d.job_id;
+          topPollTimer=setInterval(pollTop,1000);
+          pollTop();
+        }
+        async function cancelTopScan(){
+          if(!currentTopJob)return;
+          await fetch('api/top/cancel?job_id='+encodeURIComponent(currentTopJob)+'&ts='+Date.now(),{cache:'no-store'});
+        }
+        async function pollTop(){
+          if(!currentTopJob)return;
+          const r=await fetch('api/top/status?job_id='+encodeURIComponent(currentTopJob)+'&ts='+Date.now(),{cache:'no-store'});
+          const d=await r.json();
+          renderTopStatus(d);
+          if(d.status==="done"||d.status==="error"||d.status==="cancelled"){
+            if(topPollTimer){clearInterval(topPollTimer);topPollTimer=null}
+          }
+        }
+        function renderTopStatus(d){
+          if(d.error){document.getElementById("topBody").innerHTML='<p class="error">'+t(d.error)+'</p>';return}
+          let html="";
+          if(d.status==="running"||d.status==="queued"){
+            html+='<div class="spinnerWrap"><div class="spinner"></div><div><b>Сканирование идёт...</b><div class="pathNow">Сейчас: '+t(d.current_path)+'</div></div></div>';
+          }
+          if(d.status==="cancelled")html+='<p class="warnText">Сканирование отменено.</p>';
+          if(d.status==="done"&&d.timed_out){
+            html+='<p class="warnText">Сканирование упёрлось в лимит '+t(d.timeout_sec)+' сек. Можно выбрать режим дольше или “Полный скан — без таймаута” и запустить заново.</p>';
+          }
+          if(d.status==="done"&&!d.timed_out)html+='<p>Готово.</p>';
+          html+='<div class="progress">Просмотрено элементов: '+t(d.scanned_entries||0)+' · файлов: '+t(d.scanned_files||0)+' · ошибок доступа: '+t(d.errors||0)+'</div>';
+          const items=d.items||[];
+          html+='<table class="table"><tr><th>Папка/файл</th><th>Тип</th><th>Размер</th><th>Путь</th></tr>';
+          items.forEach(function(x){html+='<tr><td>'+t(x.name)+'</td><td>'+t(x.type)+'</td><td>'+t(x.size_gb)+' GB</td><td>'+t(x.host_path)+'</td></tr>'});
+          html+='</table>';
+          document.getElementById("topBody").innerHTML=html;
+        }
+
+        load();
+        setInterval(load,5000);
+        setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},5000);
+        </script>
+        </body>
+        </html>"""
 
 
         class Handler(BaseHTTPRequestHandler):
@@ -1021,6 +1698,10 @@ services:
                     self.send_json(history_data(query))
                     return
 
+                if path == "/api/history/clear":
+                    self.send_json(clear_history())
+                    return
+
                 if path == "/api/top/start":
                     self.send_json(start_top_job(query))
                     return
@@ -1041,6 +1722,7 @@ services:
 
 
         init_db()
+        compact_history(True)
         threading.Thread(target=sampler_loop, daemon=True).start()
         ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
         PY
