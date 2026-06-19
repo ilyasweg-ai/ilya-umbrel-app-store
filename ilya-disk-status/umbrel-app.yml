@@ -4,7 +4,7 @@ name: Disk Status
 tagline: Disk usage, history and live I/O dashboard
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-disk-status/icon.svg
 category: files
-version: "1.5.1"
+version: "1.5.2"
 port: 8080
 description: >-
   Simple page showing used and free space for Umbrel system/data storage, mounted external disks, network mounts, disk usage history, live disk read/write I/O, and top folders.
@@ -16,8 +16,4 @@ repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
 support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
 gallery: []
 releaseNotes: >-
-  Added tiered history compaction: 1s for 24h, 10s for 7d, 60s after that, removed automatic retention deletion, added history database size tooltips and clear history button with confirmation.
-dependencies: []
-path: ""
-defaultUsername: ""
-defaultPassword: ""
+  Fixed loading hang by moving history compaction out of the page/API request path. Compaction now starts later in the background, so the dashboard opens immediately.
