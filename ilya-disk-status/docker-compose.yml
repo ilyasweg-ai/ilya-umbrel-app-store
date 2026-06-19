@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.4.1"
+        APP_VERSION = "1.5.1"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -35,8 +35,10 @@ services:
 
         DATA_DIR = "/data"
         DB_PATH = DATA_DIR + "/history.sqlite"
-        SAMPLE_INTERVAL_SEC = 30
-        RETENTION_DAYS = 90
+        SAMPLE_INTERVAL_SEC = 1
+        COMPACT_EVERY_SEC = 300
+        KEEP_RAW_SEC = 24 * 3600
+        KEEP_10S_SEC = 7 * 24 * 3600
         DEFAULT_TOP_SCAN_TIMEOUT_SEC = 25
 
         NETWORK_FS_TYPES = {
@@ -53,8 +55,15 @@ services:
 
         db_lock = threading.Lock()
         jobs_lock = threading.Lock()
+        cache_lock = threading.Lock()
+        io_lock = threading.Lock()
+
         top_jobs = {}
         last_sample_ts = 0
+        last_compact_ts = 0
+        latest_payload = None
+        prev_diskstats = {}
+        prev_diskstats_ts = None
 
 
         def now_ts():
@@ -82,6 +91,10 @@ services:
 
         def gib(value):
             return round(value / 1073741824, 1)
+
+
+        def mib(value):
+            return round(value / 1048576, 2)
 
 
         def disk_key(kind, host_path, source=""):
@@ -116,6 +129,18 @@ services:
             if not mounts:
                 mounts = parse_mountinfo("/proc/self/mountinfo")
             return mounts
+
+
+        def find_mount_for_path(mounts, host_path):
+            best = None
+            for mount in mounts:
+                mp = mount.get("mount_point", "")
+                if not mp:
+                    continue
+                if is_under(host_path, mp):
+                    if best is None or len(mp) > len(best.get("mount_point", "")):
+                        best = mount
+            return best or {}
 
 
         def is_network_mount(mount):
@@ -253,6 +278,115 @@ services:
             return hidden
 
 
+        def read_diskstats():
+            stats = {}
+            try:
+                with open("/proc/diskstats", "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) < 14:
+                            continue
+
+                        name = parts[2]
+
+                        try:
+                            reads = int(parts[3])
+                            sectors_read = int(parts[5])
+                            writes = int(parts[7])
+                            sectors_written = int(parts[9])
+                            io_ms = int(parts[12])
+                        except Exception:
+                            continue
+
+                        stats[name] = {
+                            "reads": reads,
+                            "writes": writes,
+                            "read_bytes": sectors_read * 512,
+                            "write_bytes": sectors_written * 512,
+                            "io_ms": io_ms,
+                        }
+            except Exception:
+                pass
+            return stats
+
+
+        def source_to_device_name(source):
+            if not source or not source.startswith("/dev/"):
+                return ""
+
+            if source.startswith("/dev/mapper/"):
+                try:
+                    real = os.path.realpath(HOSTROOT + source)
+                    base = os.path.basename(real)
+                    if base:
+                        return base
+                except Exception:
+                    pass
+
+            return os.path.basename(source)
+
+
+        def compute_io_rates():
+            global prev_diskstats, prev_diskstats_ts
+
+            current = read_diskstats()
+            ts = time.time()
+            rates = {}
+
+            with io_lock:
+                if prev_diskstats and prev_diskstats_ts:
+                    dt = max(0.001, ts - prev_diskstats_ts)
+
+                    for dev, cur in current.items():
+                        prev = prev_diskstats.get(dev)
+                        if not prev:
+                            continue
+
+                        read_delta = max(0, cur["read_bytes"] - prev.get("read_bytes", 0))
+                        write_delta = max(0, cur["write_bytes"] - prev.get("write_bytes", 0))
+                        reads_delta = max(0, cur["reads"] - prev.get("reads", 0))
+                        writes_delta = max(0, cur["writes"] - prev.get("writes", 0))
+                        io_ms_delta = max(0, cur["io_ms"] - prev.get("io_ms", 0))
+
+                        rates[dev] = {
+                            "io_device": dev,
+                            "io_available": True,
+                            "read_mbps": round(read_delta / dt / 1048576, 3),
+                            "write_mbps": round(write_delta / dt / 1048576, 3),
+                            "read_iops": round(reads_delta / dt, 1),
+                            "write_iops": round(writes_delta / dt, 1),
+                            "io_util_percent": round(min(100, io_ms_delta / (dt * 10)), 1),
+                        }
+
+                prev_diskstats = current
+                prev_diskstats_ts = ts
+
+            return rates
+
+
+        def attach_io(cards):
+            rates = compute_io_rates()
+
+            for card in cards:
+                source = card.get("source", "")
+                dev = source_to_device_name(source)
+
+                if dev and dev in rates:
+                    card.update(rates[dev])
+                else:
+                    card.update({
+                        "io_device": dev,
+                        "io_available": False,
+                        "read_mbps": 0,
+                        "write_mbps": 0,
+                        "read_iops": 0,
+                        "write_iops": 0,
+                        "io_util_percent": 0,
+                    })
+
+            return cards
+
+
         def collect_disks():
             cards = []
             seen_host_paths = set()
@@ -260,8 +394,12 @@ services:
             mounts = host_mounts()
 
             try:
+                system_mount = find_mount_for_path(mounts, HOST_UMBREL_ROOT)
+                system_source = system_mount.get("source", "")
+                system_fs_type = system_mount.get("fs_type", "")
+
                 system_card = {
-                    **stat_card("UMBREL_DATA", HOST_UMBREL_ROOT, "system"),
+                    **stat_card("UMBREL_DATA", HOST_UMBREL_ROOT, "system", source=system_source, fs_type=system_fs_type),
                     "path": SYSTEM_PATH,
                 }
                 add_unique(cards, seen_host_paths, seen_signatures, system_card)
@@ -326,6 +464,7 @@ services:
                         "error": str(err),
                     })
 
+            attach_io(cards)
             return cards, hidden_external_folders(mounts)
 
 
@@ -348,7 +487,23 @@ services:
                         percent real
                     )
                 """)
+
+                existing_cols = {row[1] for row in conn.execute("pragma table_info(samples)").fetchall()}
+                for col, col_type in [
+                    ("read_mbps", "real"),
+                    ("write_mbps", "real"),
+                    ("read_iops", "real"),
+                    ("write_iops", "real"),
+                    ("io_util_percent", "real"),
+                    ("bucket_10s", "integer"),
+                    ("bucket_60s", "integer"),
+                ]:
+                    if col not in existing_cols:
+                        conn.execute(f"alter table samples add column {col} {col_type}")
+
                 conn.execute("create index if not exists idx_samples_key_ts on samples(disk_key, ts)")
+                conn.execute("create index if not exists idx_samples_key_bucket10 on samples(disk_key, bucket_10s)")
+                conn.execute("create index if not exists idx_samples_key_bucket60 on samples(disk_key, bucket_60s)")
                 conn.execute("""
                     create table if not exists disk_state (
                         disk_key text primary key,
@@ -373,7 +528,7 @@ services:
         def save_sample(cards):
             global last_sample_ts
             ts = now_ts()
-            if ts - last_sample_ts < SAMPLE_INTERVAL_SEC - 1:
+            if ts - last_sample_ts < SAMPLE_INTERVAL_SEC:
                 return
 
             last_sample_ts = ts
@@ -414,13 +569,18 @@ services:
                     conn.execute(
                         """
                         insert into samples
-                        (ts,disk_key,name,kind,host_path,source,fs_type,total_gb,used_gb,free_gb,percent)
-                        values (?,?,?,?,?,?,?,?,?,?,?)
+                        (ts,disk_key,name,kind,host_path,source,fs_type,total_gb,used_gb,free_gb,percent,read_mbps,write_mbps,read_iops,write_iops,io_util_percent,bucket_10s,bucket_60s)
+                        values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             ts, key, card.get("name"), card.get("kind"), card.get("host_path"),
                             card.get("source"), card.get("fs_type"), card.get("total_gb"),
-                            card.get("used_gb"), card.get("free_gb"), card.get("percent")
+                            card.get("used_gb"), card.get("free_gb"), card.get("percent"),
+                            card.get("read_mbps", 0), card.get("write_mbps", 0),
+                            card.get("read_iops", 0), card.get("write_iops", 0),
+                            card.get("io_util_percent", 0),
+                            ts // 10,
+                            ts // 60,
                         )
                     )
 
@@ -449,13 +609,123 @@ services:
                         )
                     )
 
-                cutoff = ts - RETENTION_DAYS * 86400
-                conn.execute("delete from samples where ts < ?", (cutoff,))
                 conn.commit()
                 conn.close()
 
 
+
+        def compact_history_if_needed():
+            global last_compact_ts
+
+            ts = now_ts()
+            if ts - last_compact_ts < COMPACT_EVERY_SEC:
+                return
+
+            last_compact_ts = ts
+            cutoff_24h = ts - KEEP_RAW_SEC
+            cutoff_7d = ts - KEEP_10S_SEC
+
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+
+                # Older than 24h: keep one point per 10 seconds.
+                conn.execute("""
+                    delete from samples
+                    where ts < ?
+                      and rowid not in (
+                        select max(rowid)
+                        from samples
+                        where ts < ?
+                        group by disk_key, bucket_10s
+                      )
+                """, (cutoff_24h, cutoff_24h))
+
+                # Older than 7d: keep one point per 60 seconds. No time-based auto-delete after that.
+                conn.execute("""
+                    delete from samples
+                    where ts < ?
+                      and rowid not in (
+                        select max(rowid)
+                        from samples
+                        where ts < ?
+                        group by disk_key, bucket_60s
+                      )
+                """, (cutoff_7d, cutoff_7d))
+
+                conn.commit()
+                try:
+                    conn.execute("vacuum")
+                except Exception:
+                    pass
+                conn.close()
+
+
+        def db_stats():
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                total_rows = conn.execute("select count(*) from samples").fetchone()[0] or 0
+                db_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+
+                rows = conn.execute("""
+                    select
+                      s.disk_key,
+                      coalesce(ds.name, max(s.name), s.disk_key) as name,
+                      coalesce(ds.kind, max(s.kind), '') as kind,
+                      coalesce(ds.host_path, max(s.host_path), '') as host_path,
+                      count(*) as rows_count,
+                      min(s.ts) as first_ts,
+                      max(s.ts) as last_ts
+                    from samples s
+                    left join disk_state ds on ds.disk_key = s.disk_key
+                    group by s.disk_key
+                """).fetchall()
+                conn.close()
+
+            disks = {}
+            for row in rows:
+                key = row[0]
+                rows_count = row[4] or 0
+                estimated_bytes = int(db_bytes * (rows_count / total_rows)) if total_rows else 0
+                disks[key] = {
+                    "disk_key": key,
+                    "name": row[1],
+                    "kind": row[2],
+                    "host_path": row[3],
+                    "rows": rows_count,
+                    "estimated_bytes": estimated_bytes,
+                    "estimated_mb": mib(estimated_bytes),
+                    "first_ts": row[5],
+                    "last_ts": row[6],
+                }
+
+            return {
+                "db_bytes": db_bytes,
+                "db_mb": mib(db_bytes),
+                "total_rows": total_rows,
+                "disks": disks,
+                "policy": "1 секунда за последние 24 часа, 10 секунд до 7 дней, 1 минута дальше. Автоудаления по сроку нет.",
+            }
+
+
+        def clear_history():
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("delete from samples")
+                conn.execute("delete from disk_state")
+                conn.commit()
+                try:
+                    conn.execute("vacuum")
+                except Exception:
+                    pass
+                conn.close()
+
+            return db_stats()
+
+
         def add_state_to_cards(cards):
+            stats = db_stats()
+            disk_stats = stats.get("disks", {})
+
             with db_lock:
                 conn = sqlite3.connect(DB_PATH)
                 rows = conn.execute(
@@ -470,20 +740,48 @@ services:
                 if state:
                     card.update(state)
 
+                h = disk_stats.get(card.get("key"), {})
+                card["history_rows"] = h.get("rows", 0)
+                card["history_estimated_mb"] = h.get("estimated_mb", 0)
+                card["history_first_ts"] = h.get("first_ts")
+                card["history_last_ts"] = h.get("last_ts")
+
             return cards
 
 
+        def make_payload():
+            compact_history_if_needed()
+            cards, hidden = collect_disks()
+            save_sample(cards)
+            add_state_to_cards(cards)
+            stats = db_stats()
+
+            return {
+                "disks": cards,
+                "hidden_unmounted_external_folders": hidden,
+                "updated_at": now_ts(),
+                "app_version": APP_VERSION,
+                "sample_interval_sec": SAMPLE_INTERVAL_SEC,
+                "history_policy": stats["policy"],
+                "history_db_mb": stats["db_mb"],
+                "history_rows": stats["total_rows"],
+                "history_db_bytes": stats["db_bytes"],
+            }
+
+
         def sampler_loop():
+            global latest_payload
             while True:
                 try:
-                    cards, _ = collect_disks()
-                    save_sample(cards)
+                    payload = make_payload()
+                    with cache_lock:
+                        latest_payload = payload
                 except Exception:
                     pass
-                time.sleep(5)
+                time.sleep(SAMPLE_INTERVAL_SEC)
 
 
-        def decimate(points, max_points=1600):
+        def decimate(points, max_points=2200):
             if len(points) <= max_points:
                 return points
 
@@ -502,7 +800,7 @@ services:
             metric = query.get("metric", ["used_gb"])[0]
             range_sec_raw = query.get("range", ["86400"])[0]
 
-            allowed_metrics = {"used_gb", "free_gb", "percent"}
+            allowed_metrics = {"used_gb", "free_gb", "percent", "read_mbps", "write_mbps", "io_util_percent"}
             if metric not in allowed_metrics:
                 metric = "used_gb"
 
@@ -522,7 +820,10 @@ services:
             with db_lock:
                 conn = sqlite3.connect(DB_PATH)
                 rows = conn.execute(
-                    "select ts, used_gb, free_gb, percent from samples where " + where + " order by ts asc",
+                    """
+                    select ts, used_gb, free_gb, percent, read_mbps, write_mbps, io_util_percent
+                    from samples
+                    where """ + where + " order by ts asc",
                     params
                 ).fetchall()
                 meta = conn.execute(
@@ -533,8 +834,15 @@ services:
 
             points = []
             for row in rows:
-                value = row[1] if metric == "used_gb" else row[2] if metric == "free_gb" else row[3]
-                points.append({"ts": row[0], "value": value})
+                points.append({
+                    "ts": row[0],
+                    "used_gb": row[1] or 0,
+                    "free_gb": row[2] or 0,
+                    "percent": row[3] or 0,
+                    "read_mbps": row[4] or 0,
+                    "write_mbps": row[5] or 0,
+                    "io_util_percent": row[6] or 0,
+                })
 
             points = decimate(points)
 
@@ -554,18 +862,13 @@ services:
 
 
         def get_current_data():
-            cards, hidden = collect_disks()
-            save_sample(cards)
-            add_state_to_cards(cards)
+            with cache_lock:
+                cached = latest_payload
 
-            return {
-                "disks": cards,
-                "hidden_unmounted_external_folders": hidden,
-                "updated_at": now_ts(),
-                "app_version": APP_VERSION,
-                "sample_interval_sec": SAMPLE_INTERVAL_SEC,
-                "retention_days": RETENTION_DAYS,
-            }
+            if cached and now_ts() - cached.get("updated_at", 0) <= 3:
+                return cached
+
+            return make_payload()
 
 
         def allowed_scan_paths():
@@ -775,7 +1078,6 @@ services:
             job_id = uuid.uuid4().hex
 
             with jobs_lock:
-                # prune old jobs
                 cutoff = now_ts() - 3600
                 for old_id in list(top_jobs.keys()):
                     if top_jobs[old_id].get("created_at", 0) < cutoff:
@@ -833,6 +1135,7 @@ services:
         .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}
         .pill{border:1px solid #334155;background:#0f172a;color:#cbd5e1;border-radius:999px;padding:9px 13px;cursor:pointer}
         .pill.active{background:#2563eb;color:white;border-color:#60a5fa}
+        .pill.danger{border-color:#7f1d1d;color:#fecaca}
         .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(345px,1fr));gap:18px}
         .card{background:rgba(15,23,42,.92);border:1px solid #243244;border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(0,0,0,.35)}
         .top{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin-bottom:14px}
@@ -846,6 +1149,9 @@ services:
         .stat{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px}
         .label{color:#94a3b8;font-size:13px;margin-bottom:5px}
         .value{font-size:18px;font-weight:800}
+        .ioBox{margin-top:12px;background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+        .ioVal{font-weight:800;color:#bfdbfe;margin-top:3px}
+        .ioOff{color:#64748b}
         .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
         .btn{border:1px solid #334155;background:#020617;color:#dbeafe;border-radius:10px;padding:8px 10px;cursor:pointer}
         .btn:hover{background:#111827}
@@ -861,7 +1167,7 @@ services:
         .modalTitle{font-size:22px;font-weight:900}
         .close{border:1px solid #475569;background:#020617;color:white;border-radius:10px;padding:8px 12px;cursor:pointer}
         .chartControls,.scanControls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-        .chartBox{height:540px;background:#020617;border:1px solid #1e293b;border-radius:16px;padding:10px}
+        .chartBox{height:540px;background:#020617;border:1px solid #1e293b;border-radius:16px;padding:10px;position:relative}
         canvas{width:100%;height:100%;display:block}
         .table{width:100%;border-collapse:collapse;margin-top:12px}
         .table th,.table td{border-bottom:1px solid #1e293b;padding:10px;text-align:left}
@@ -872,13 +1178,15 @@ services:
         .progress{background:#020617;border:1px solid #1e293b;border-radius:14px;padding:12px;margin-top:10px}
         .pathNow{color:#94a3b8;overflow-wrap:anywhere;font-size:12px;margin-top:6px}
         .warnText{color:#fbbf24}
-        @media(max-width:800px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr}.top{flex-direction:column}.chartBox{height:420px}}
+        .legend{display:flex;gap:12px;align-items:center;color:#94a3b8;font-size:12px;margin:2px 0 10px}
+        .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+        @media(max-width:800px){.grid{grid-template-columns:1fr}.stats,.ioBox{grid-template-columns:1fr}.top{flex-direction:column}.chartBox{height:420px}}
         </style>
         </head>
         <body>
         <div class="wrap">
           <h1>Disk Status</h1>
-          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История пишется каждые 30 секунд. Карточки обновляются каждые 5 секунд.</div>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O: 1 сек за 24ч, 10 сек до недели, 1 мин дальше. Автоудаления по сроку нет.</div>
           <div class="toolbar" id="filters"></div>
           <div id="app">Загрузка...</div>
           <div class="footer" id="updated"></div>
@@ -889,7 +1197,7 @@ services:
             <div class="modalHead">
               <div>
                 <div class="modalTitle" id="historyTitle">История</div>
-                <div class="mini">Колесо мыши — приблизить/отдалить. Зажать мышь и тянуть — двигать диапазон.</div>
+                <div class="mini" id="historyHint">Колесо мыши — приблизить/отдалить. Зажать мышь и тянуть — двигать диапазон. Наведи мышкой на линию — увидишь точные значения.</div>
               </div>
               <button class="close" onclick="closeHistory()">Закрыть</button>
             </div>
@@ -898,14 +1206,21 @@ services:
                 <option value="used_gb">Занято GB</option>
                 <option value="free_gb">Свободно GB</option>
                 <option value="percent">Процент %</option>
+                <option value="read_mbps">Чтение MB/s</option>
+                <option value="write_mbps">Запись MB/s</option>
+                <option value="io_util_percent">I/O util %</option>
               </select>
+              <button class="pill" onclick="setRange(300)">5м</button>
               <button class="pill" onclick="setRange(3600)">1ч</button>
               <button class="pill" onclick="setRange(21600)">6ч</button>
               <button class="pill" onclick="setRange(86400)">24ч</button>
               <button class="pill" onclick="setRange(604800)">7д</button>
-              <button class="pill" onclick="setRange(2592000)">30д</button>
               <button class="pill" onclick="setRange(0)">Всё</button>
               <button class="pill" onclick="resetChartView()">Сбросить</button>
+            </div>
+            <div class="legend" id="ioLegend" style="display:none">
+              <span><span class="dot" style="background:#60a5fa"></span> чтение MB/s</span>
+              <span><span class="dot" style="background:#f59e0b"></span> запись MB/s</span>
             </div>
             <div class="chartBox"><canvas id="historyCanvas"></canvas></div>
           </div>
@@ -943,25 +1258,49 @@ services:
         let viewStart = null;
         let viewEnd = null;
         let drag = null;
+        let hoverX = null;
+        let ioMode = false;
         let currentTopPath = "";
         let currentTopName = "";
         let currentTopJob = "";
         let topPollTimer = null;
+        let latestDbMb = 0;
+        let latestDbRows = 0;
 
         function t(v){return v===undefined||v===null?"":String(v)}
+        function n(v){return Number(v)||0}
         function fmtTs(ts){if(!ts)return "—";return new Date(ts*1000).toLocaleString()}
         function kind(d){if(d.kind==="system")return"system / data";if(d.kind==="network")return d.fs_type?"network "+d.fs_type:"network";return"external mounted"}
         function sourceHtml(d){let p=[];if(d.source)p.push("source: "+t(d.source));if(d.host_path)p.push("path: "+t(d.host_path));return '<div class="source">'+p.join(" · ")+'</div>'}
         function copyText(x){navigator.clipboard.writeText(x).catch(function(){})}
-        function metricLabel(metric){if(metric==="free_gb")return"Свободно GB";if(metric==="percent")return"Процент %";return"Занято GB"}
+        function metricLabel(metric){if(metric==="free_gb")return"Свободно GB";if(metric==="percent")return"Процент %";if(metric==="read_mbps")return"Чтение MB/s";if(metric==="write_mbps")return"Запись MB/s";if(metric==="io_util_percent")return"I/O util %";return"Занято GB"}
+        function valOf(p,metric){return n(p[metric])}
 
         function renderFilters(){
           const items=[["all","Все"],["system","System"],["external","External"],["network","Network"]];
           let html="";
           items.forEach(function(i){
-            html+='<button class="pill '+(activeFilter===i[0]?"active":"")+'" onclick="activeFilter=\\''+i[0]+'\\';render()">'+i[1]+'</button>';
+            html+='<button class="pill '+(activeFilter===i[0]?"active":"")+'" onclick="activeFilter=\''+i[0]+'\';render()">'+i[1]+'</button>';
           });
+          html+='<button class="pill danger" id="clearHistoryBtn" onclick="clearHistory()" title="История занимает '+latestDbMb+' MB, записей: '+latestDbRows+'. Нажми, чтобы очистить всю историю по всем дискам.">Очистить историю</button>';
           document.getElementById("filters").innerHTML=html;
+        }
+
+
+        function ioHtml(d){
+          if(!d.io_available){
+            const reason = d.kind==="network" ? "для сетевых mount сейчас недоступно" : "нет block device";
+            return '<div class="ioBox ioOff"><div><div class="label">I/O</div><div class="ioVal">—</div></div><div><div class="label">Статус</div><div class="ioVal">'+reason+'</div></div><div><div class="label">Device</div><div class="ioVal">'+(d.io_device||"—")+'</div></div></div>';
+          }
+          return '<div class="ioBox">'+
+            '<div><div class="label">Чтение</div><div class="ioVal">'+t(d.read_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">Запись</div><div class="ioVal">'+t(d.write_mbps)+' MB/s</div></div>'+
+            '<div><div class="label">I/O util</div><div class="ioVal">'+t(d.io_util_percent)+'%</div></div>'+
+          '</div>';
+        }
+
+        function historyTitle(d){
+          return 'История диска '+t(d.name)+': '+t(d.history_rows||0)+' записей, примерно '+t(d.history_estimated_mb||0)+' MB. База целиком: '+latestDbMb+' MB / '+latestDbRows+' записей.';
         }
 
         function card(d){
@@ -977,12 +1316,14 @@ services:
               '<div class="stat"><div class="label">Свободно</div><div class="value">'+t(d.free_gb)+' GB</div></div>'+
               '<div class="stat"><div class="label">Всего</div><div class="value">'+t(d.total_gb)+' GB</div></div>'+
             '</div>'+
+            ioHtml(d)+
             sourceHtml(d)+
-            '<div class="mini">Первый раз: '+fmtTs(d.first_seen)+'<br>Последний раз виден: '+fmtTs(d.last_seen)+'<br>Последнее изменение: '+fmtTs(d.last_changed)+'</div>'+
+            '<div class="mini">Первый раз: '+fmtTs(d.first_seen)+'<br>Последний раз виден: '+fmtTs(d.last_seen)+'<br>Последнее изменение: '+fmtTs(d.last_changed)+'<br>История: '+t(d.history_rows||0)+' записей / ~'+t(d.history_estimated_mb||0)+' MB</div>'+
             '<div class="actions">'+
-              '<button class="btn" onclick="openHistory(\\''+t(d.key)+'\\',\\''+t(d.name).replace(/'/g,"")+'\\')">История</button>'+
-              '<button class="btn" onclick="openTop(\\''+encodeURIComponent(t(d.host_path))+'\\',\\''+t(d.name).replace(/'/g,"")+'\\')">Топ папок</button>'+
-              '<button class="btn" onclick="copyText(\\''+t(d.host_path).replace(/'/g,"")+'\\')">Copy path</button>'+
+              '<button class="btn" title="'+historyTitle(d).replace(/"/g,"'")+'" onclick="openHistory(\''+t(d.key)+'\',\''+t(d.name).replace(/'/g,"")+'\')">История</button>'+
+              '<button class="btn" onclick="openIo(\''+t(d.key)+'\',\''+t(d.name).replace(/'/g,"")+'\')">Live I/O</button>'+
+              '<button class="btn" onclick="openTop(\''+encodeURIComponent(t(d.host_path))+'\',\''+t(d.name).replace(/'/g,"")+'\')">Топ папок</button>'+
+              '<button class="btn" onclick="copyText(\''+t(d.host_path).replace(/'/g,"")+'\')">Copy path</button>'+
             '</div>'+
           '</div>';
         }
@@ -1002,8 +1343,10 @@ services:
             const r=await fetch('api/disks?ts='+Date.now(),{cache:'no-store'});
             const d=await r.json();
             allDisks=d.disks||[];
+            latestDbMb=t(d.history_db_mb||0);
+            latestDbRows=t(d.history_rows||0);
             render();
-            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · запись истории каждые '+t(d.sample_interval_sec)+' сек.';
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история: '+latestDbMb+' MB / '+latestDbRows+' записей · '+t(d.history_policy);
             if(d.hidden_unmounted_external_folders&&d.hidden_unmounted_external_folders.length){
               f+='<details class="hidden"><summary>Скрытые обычные папки без mount ('+d.hidden_unmounted_external_folders.length+')</summary>';
               d.hidden_unmounted_external_folders.forEach(function(x){f+='<div>'+t(x.name)+' — '+t(x.host_path)+'</div>'});
@@ -1015,20 +1358,44 @@ services:
           }
         }
 
+        async function clearHistory(){
+          const msg='Ты точно хочешь стереть всю историю по всем дискам?\n\nСейчас база истории занимает примерно '+latestDbMb+' MB, записей: '+latestDbRows+'.\n\nТекущая занятость дисков не пропадёт, но графики истории начнутся заново.';
+          if(!confirm(msg)) return;
+          const r=await fetch('api/history/clear?ts='+Date.now(),{cache:'no-store'});
+          const d=await r.json();
+          alert('История очищена. Сейчас база: '+t(d.db_mb||0)+' MB, записей: '+t(d.total_rows||0));
+          await load();
+        }
+
         function openHistory(key,name){
+          ioMode=false;
           currentHistoryDisk=key;
+          currentRange=86400;
           document.getElementById("historyTitle").textContent="История: "+name;
           document.getElementById("historyOverlay").style.display="flex";
-          viewStart=null;viewEnd=null;
+          document.getElementById("metricSelect").style.display="";
+          document.getElementById("ioLegend").style.display="none";
+          viewStart=null;viewEnd=null;hoverX=null;
+          loadHistory();
+        }
+        function openIo(key,name){
+          ioMode=true;
+          currentHistoryDisk=key;
+          currentRange=300;
+          document.getElementById("historyTitle").textContent="Live I/O: "+name;
+          document.getElementById("historyOverlay").style.display="flex";
+          document.getElementById("metricSelect").style.display="none";
+          document.getElementById("ioLegend").style.display="flex";
+          viewStart=null;viewEnd=null;hoverX=null;
           loadHistory();
         }
         function closeHistory(){document.getElementById("historyOverlay").style.display="none"}
         function setRange(sec){currentRange=sec;viewStart=null;viewEnd=null;loadHistory()}
-        function resetChartView(){viewStart=null;viewEnd=null;drawChart()}
+        function resetChartView(){viewStart=null;viewEnd=null;hoverX=null;drawChart()}
 
         async function loadHistory(){
           if(!currentHistoryDisk)return;
-          const metric=document.getElementById("metricSelect").value;
+          const metric=ioMode ? "read_mbps" : document.getElementById("metricSelect").value;
           const r=await fetch('api/history?disk='+encodeURIComponent(currentHistoryDisk)+'&metric='+metric+'&range='+currentRange+'&ts='+Date.now(),{cache:'no-store'});
           const d=await r.json();
           historyPoints=d.points||[];
@@ -1037,6 +1404,20 @@ services:
             if(viewEnd===null)viewEnd=historyPoints[historyPoints.length-1].ts*1000;
           }
           drawChart();
+        }
+
+        function drawLine(ctx,pts,metric,x,y,color){
+          ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
+          pts.forEach(function(p,i){let xx=x(p.ts*1000),yy=y(valOf(p,metric));if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});
+          ctx.stroke();
+        }
+
+        function roundRect(ctx,x,y,w,h,r){
+          ctx.beginPath();
+          ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+          ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+          ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+          ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
         }
 
         function drawChart(){
@@ -1049,31 +1430,70 @@ services:
           const w=canvas.width/devicePixelRatio,h=canvas.height/devicePixelRatio;
           ctx.clearRect(0,0,w,h);
           ctx.fillStyle="#020617";ctx.fillRect(0,0,w,h);
-          const padL=62,padR=18,padT=24,padB=48;
+          const padL=70,padR=18,padT=26,padB=50;
           const pts=historyPoints.filter(function(p){const ms=p.ts*1000;return viewStart===null||ms>=viewStart&&ms<=viewEnd});
           ctx.strokeStyle="#1e293b";ctx.lineWidth=1;
-          for(let i=0;i<6;i++){let y=padT+(h-padT-padB)*i/5;ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke()}
-          if(!pts.length){ctx.fillStyle="#94a3b8";ctx.fillText("Пока нет данных истории. Подожди 30-60 секунд.",padL,padT+30);return}
-          let min=Math.min(...pts.map(p=>p.value)),max=Math.max(...pts.map(p=>p.value));
+          for(let i=0;i<6;i++){let yy=padT+(h-padT-padB)*i/5;ctx.beginPath();ctx.moveTo(padL,yy);ctx.lineTo(w-padR,yy);ctx.stroke()}
+          if(!pts.length){ctx.fillStyle="#94a3b8";ctx.fillText("Пока нет данных. Подожди несколько секунд.",padL,padT+30);return}
+
+          const metrics = ioMode ? ["read_mbps","write_mbps"] : [document.getElementById("metricSelect").value];
+          let values=[];
+          pts.forEach(function(p){metrics.forEach(function(m){values.push(valOf(p,m))})});
+          let min=Math.min(...values),max=Math.max(...values);
           if(min===max){min-=1;max+=1}
+          if(ioMode){min=0}
+
           const x0=viewStart||pts[0].ts*1000,x1=viewEnd||pts[pts.length-1].ts*1000;
           function x(ms){return padL+(ms-x0)/(x1-x0)*(w-padL-padR)}
           function y(v){return h-padB-(v-min)/(max-min)*(h-padT-padB)}
           ctx.fillStyle="#94a3b8";ctx.font="12px system-ui";
           for(let i=0;i<6;i++){let val=min+(max-min)*(5-i)/5;let yy=padT+(h-padT-padB)*i/5;ctx.fillText(val.toFixed(1),8,yy+4)}
-          ctx.beginPath();ctx.strokeStyle="#60a5fa";ctx.lineWidth=2;
-          pts.forEach(function(p,i){let xx=x(p.ts*1000),yy=y(p.value);if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});
-          ctx.stroke();
+          if(ioMode){
+            drawLine(ctx,pts,"read_mbps",x,y,"#60a5fa");
+            drawLine(ctx,pts,"write_mbps",x,y,"#f59e0b");
+            ctx.fillStyle="#cbd5e1";ctx.fillText("MB/s",padL,padT-8);
+          }else{
+            const metric=document.getElementById("metricSelect").value;
+            drawLine(ctx,pts,metric,x,y,"#60a5fa");
+            ctx.fillStyle="#cbd5e1";ctx.fillText(metricLabel(metric),padL,padT-8);
+          }
+
+          if(hoverX!==null && hoverX>=padL && hoverX<=w-padR){
+            const hoverMs=x0+(hoverX-padL)/(w-padL-padR)*(x1-x0);
+            let nearest=pts[0],best=Math.abs(pts[0].ts*1000-hoverMs);
+            pts.forEach(function(p){let diff=Math.abs(p.ts*1000-hoverMs);if(diff<best){best=diff;nearest=p}});
+            const hx=x(nearest.ts*1000);
+            ctx.strokeStyle="#64748b";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(hx,padT);ctx.lineTo(hx,h-padB);ctx.stroke();
+            const boxW=244,boxH=112;
+            let bx=hx+12;if(bx+boxW>w-padR)bx=hx-boxW-12;
+            let by=padT+12;
+            ctx.fillStyle="rgba(15,23,42,.96)";ctx.strokeStyle="#334155";ctx.lineWidth=1;
+            roundRect(ctx,bx,by,boxW,boxH,10);ctx.fill();ctx.stroke();
+            ctx.fillStyle="#e5e7eb";ctx.font="12px system-ui";
+            ctx.fillText(new Date(nearest.ts*1000).toLocaleString(),bx+10,by+20);
+            ctx.fillStyle="#bfdbfe";ctx.fillText("Занято: "+n(nearest.used_gb).toFixed(1)+" GB",bx+10,by+40);
+            ctx.fillStyle="#bbf7d0";ctx.fillText("Свободно: "+n(nearest.free_gb).toFixed(1)+" GB",bx+10,by+58);
+            ctx.fillStyle="#fde68a";ctx.fillText("Процент: "+n(nearest.percent).toFixed(1)+"%",bx+10,by+76);
+            ctx.fillStyle="#93c5fd";ctx.fillText("Чтение: "+n(nearest.read_mbps).toFixed(3)+" MB/s",bx+10,by+94);
+            ctx.fillStyle="#fdba74";ctx.fillText("Запись: "+n(nearest.write_mbps).toFixed(3)+" MB/s",bx+122,by+94);
+          }
+
           ctx.fillStyle="#cbd5e1";
-          const metric=document.getElementById("metricSelect").value;
-          ctx.fillText(metricLabel(metric),padL,padT-8);
           ctx.fillText(new Date(x0).toLocaleString(),padL,h-16);
           ctx.textAlign="right";ctx.fillText(new Date(x1).toLocaleString(),w-padR,h-16);ctx.textAlign="left";
         }
 
-        document.addEventListener("wheel",function(e){
-          if(document.getElementById("historyOverlay").style.display!=="flex")return;
-          if(e.target.id!=="historyCanvas")return;
+        const historyCanvas = document.getElementById("historyCanvas");
+        historyCanvas.addEventListener("mousemove", function(e){
+          const rect=e.target.getBoundingClientRect();
+          hoverX=e.clientX-rect.left;
+          if(!drag)drawChart();
+        });
+        historyCanvas.addEventListener("mouseleave", function(){
+          hoverX=null;
+          drawChart();
+        });
+        historyCanvas.addEventListener("wheel",function(e){
           e.preventDefault();
           if(!historyPoints.length)return;
           const rect=e.target.getBoundingClientRect();
@@ -1087,12 +1507,12 @@ services:
           if(ns<allS)ns=allS;if(ne>allE)ne=allE;
           if(ne-ns>1000){viewStart=ns;viewEnd=ne;drawChart()}
         },{passive:false});
-        document.addEventListener("mousedown",function(e){
-          if(e.target.id==="historyCanvas")drag={x:e.clientX,start:viewStart,end:viewEnd};
+        historyCanvas.addEventListener("mousedown",function(e){
+          drag={x:e.clientX,start:viewStart,end:viewEnd};
         });
         document.addEventListener("mousemove",function(e){
           if(!drag||!historyPoints.length)return;
-          const rect=document.getElementById("historyCanvas").getBoundingClientRect();
+          const rect=historyCanvas.getBoundingClientRect();
           const dx=e.clientX-drag.x;
           const span=drag.end-drag.start;
           const shift=-dx/rect.width*span;
@@ -1161,7 +1581,7 @@ services:
 
         load();
         setInterval(load,5000);
-        setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},15000);
+        setInterval(function(){if(document.getElementById("historyOverlay").style.display==="flex")loadHistory()},5000);
         </script>
         </body>
         </html>"""
@@ -1198,6 +1618,14 @@ services:
 
                 if path == "/api/history":
                     self.send_json(history_data(query))
+                    return
+
+                if path == "/api/history/stats":
+                    self.send_json(db_stats())
+                    return
+
+                if path == "/api/history/clear":
+                    self.send_json(clear_history())
                     return
 
                 if path == "/api/top/start":
