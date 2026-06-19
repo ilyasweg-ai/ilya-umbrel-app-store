@@ -27,7 +27,7 @@ services:
         import time
         import uuid
 
-        APP_VERSION = "1.6.2"
+        APP_VERSION = "1.6.3"
         HOSTROOT = "/hostroot"
         SYSTEM_PATH = "/umbrel-root"
         HOST_UMBREL_ROOT = "${UMBREL_ROOT}".rstrip("/")
@@ -69,6 +69,8 @@ services:
         last_compact_ts = 0
         latest_payload = None
         prev_io_states = {}
+        io_window_states = {}
+        IO_SMOOTH_WINDOW_SEC = 8
 
 
         def now_ts():
@@ -344,6 +346,8 @@ services:
                 if prev_diskstats and prev_diskstats_ts:
                     dt = max(0.001, ts - prev_diskstats_ts)
 
+                    reader_windows = io_window_states.setdefault(reader, {})
+
                     for dev, cur in current.items():
                         prev = prev_diskstats.get(dev)
                         if not prev:
@@ -355,15 +359,44 @@ services:
                         writes_delta = max(0, cur["writes"] - prev.get("writes", 0))
                         io_ms_delta = max(0, cur["io_ms"] - prev.get("io_ms", 0))
 
+                        raw = {
+                            "read_mbps": read_delta / dt / 1048576,
+                            "write_mbps": write_delta / dt / 1048576,
+                            "read_iops": reads_delta / dt,
+                            "write_iops": writes_delta / dt,
+                            "io_util_percent": min(100, io_ms_delta / (dt * 10)),
+                        }
+
+                        window = reader_windows.setdefault(dev, [])
+                        window.append((ts, raw))
+                        cutoff = ts - IO_SMOOTH_WINDOW_SEC
+                        while window and window[0][0] < cutoff:
+                            window.pop(0)
+
+                        def avg(metric):
+                            if not window:
+                                return 0
+                            return sum(item[1].get(metric, 0) for item in window) / len(window)
+
                         rates[dev] = {
                             "io_device": dev,
                             "io_available": True,
-                            "read_mbps": round(read_delta / dt / 1048576, 3),
-                            "write_mbps": round(write_delta / dt / 1048576, 3),
-                            "read_iops": round(reads_delta / dt, 1),
-                            "write_iops": round(writes_delta / dt, 1),
-                            "io_util_percent": round(min(100, io_ms_delta / (dt * 10)), 1),
+
+                            # Smoothed values shown in UI and written to history.
+                            "read_mbps": round(avg("read_mbps"), 3),
+                            "write_mbps": round(avg("write_mbps"), 3),
+                            "read_iops": round(avg("read_iops"), 1),
+                            "write_iops": round(avg("write_iops"), 1),
+                            "io_util_percent": round(avg("io_util_percent"), 1),
+
+                            # Raw values kept for diagnostics/future UI if needed.
+                            "raw_read_mbps": round(raw["read_mbps"], 3),
+                            "raw_write_mbps": round(raw["write_mbps"], 3),
+                            "raw_io_util_percent": round(raw["io_util_percent"], 1),
+
                             "interval_sec": round(dt, 3),
+                            "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
+                            "smooth_samples": len(window),
                         }
 
                 prev_io_states[reader] = {"stats": current, "ts": ts}
@@ -390,6 +423,8 @@ services:
                         "write_iops": 0,
                         "io_util_percent": 0,
                         "interval_sec": 0,
+                        "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
+                        "smooth_samples": 0,
                     })
 
             return cards
@@ -797,6 +832,40 @@ services:
                 time.sleep(SAMPLE_INTERVAL_SEC)
 
 
+
+        def smooth_io_points(points, window_sec=8):
+            if not points:
+                return points
+
+            result = []
+            window = []
+
+            for point in points:
+                ts = point.get("ts", 0)
+                window.append(point)
+                cutoff = ts - window_sec
+                while window and window[0].get("ts", 0) < cutoff:
+                    window.pop(0)
+
+                smoothed = dict(point)
+                if window:
+                    for metric, digits in (
+                        ("read_mbps", 3),
+                        ("write_mbps", 3),
+                        ("read_iops", 1),
+                        ("write_iops", 1),
+                        ("io_util_percent", 1),
+                    ):
+                        smoothed[metric] = round(
+                            sum(float(item.get(metric, 0) or 0) for item in window) / len(window),
+                            digits
+                        )
+
+                result.append(smoothed)
+
+            return result
+
+
         def decimate(points, max_points=2200):
             if len(points) <= max_points:
                 return points
@@ -884,6 +953,7 @@ services:
                     "io_util_percent": row[6] or 0,
                 })
 
+            points = smooth_io_points(points, IO_SMOOTH_WINDOW_SEC)
             points = decimate(points)
 
             return {
@@ -957,6 +1027,8 @@ services:
                     "write_iops": 0,
                     "io_util_percent": 0,
                     "interval_sec": 0,
+                        "smooth_window_sec": IO_SMOOTH_WINDOW_SEC,
+                        "smooth_samples": 0,
                 }
 
                 if dev and dev in rates:
@@ -1287,7 +1359,7 @@ services:
         <body>
         <div class="wrap">
           <h1>Disk Status</h1>
-          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждую 1 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
+          <div class="sub">Системный раздел, реальные внешние диски и сетевые mount-диски. История/I/O пишутся каждую секунду. Live I/O на карточках обновляется каждую 1 сек и сглаживается за 8 сек. Глубина истории: 1 секунда за 24ч, 10 секунд за 7 дней, 1 минута за 30 дней.</div>
           <div class="toolbar" id="filters"></div>
           <div id="app">Загрузка...</div>
           <div class="footer" id="updated"></div>
@@ -1420,7 +1492,7 @@ services:
               '<div><div class="label">Device</div><div class="ioVal utilVal">'+(d.io_device||"—")+'</div></div>'+
             '</div>';
           }
-          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждую ~1 сек">'+
+          return '<div class="ioBox" data-io-key="'+key+'" title="Live I/O обновляется каждую ~1 сек; показано сглаженное среднее за ~8 сек">'+
             '<div><div class="label">Чтение</div><div class="ioVal readVal">'+t(d.read_mbps)+' MB/s</div></div>'+
             '<div><div class="label">Запись</div><div class="ioVal writeVal">'+t(d.write_mbps)+' MB/s</div></div>'+
             '<div><div class="label">I/O util</div><div class="ioVal utilVal">'+t(d.io_util_percent)+'%</div></div>'+
@@ -1501,7 +1573,7 @@ services:
                 if(read)read.textContent=t(io.read_mbps)+" MB/s";
                 if(write)write.textContent=t(io.write_mbps)+" MB/s";
                 if(util)util.textContent=t(io.io_util_percent)+"%";
-                box.title="Live I/O: обновлено "+new Date().toLocaleTimeString()+" · интервал "+t(io.interval_sec)+" сек.";
+                box.title="Live I/O: обновлено "+new Date().toLocaleTimeString()+" · сглаживание "+t(io.smooth_window_sec || 8)+" сек. · raw interval "+t(io.interval_sec)+" сек.";
               }else{
                 box.classList.add("ioOff");
               }
@@ -1525,7 +1597,7 @@ services:
             allDisks=d.disks||[];
             latestHistoryStats=d.history_stats||null;
             render();
-            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 1 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
+            let f='Последнее обновление: '+new Date().toLocaleString()+' · версия '+t(d.app_version)+' · история/I/O каждую '+t(d.sample_interval_sec)+' сек. · live I/O 1 сек / сглаживание 8 сек. · policy: 1s/24h, 10s/7d, 60s/30d';
             if(d.history_stats){
               f+=' · база истории: '+t(d.history_stats.db_size_mb)+' MB · записей: '+t(d.history_stats.total_rows);
             }
