@@ -12,13 +12,9 @@ MP4 in the output folder.
 
 ## What Works Now
 
-- Docker image with Python, FastAPI, FFmpeg, and FFprobe
-- Umbrel install uses a self-contained `docker-compose.yml` with the public
-  `python:3.12-slim` image. The compose file writes the app code into the
-  container at startup, so Umbrel does not need a local Docker build or relative
-  app-file bind mounts.
-- JavaScript template strings are escaped inside `docker-compose.yml` so Docker
-  Compose does not treat them as environment variables during install.
+- Prebuilt Docker image with Python, FastAPI, FFmpeg, FFprobe, and dependencies
+- Small Umbrel `docker-compose.yml` that only pulls the GHCR image
+- GitHub Actions workflow for publishing the image to GHCR
 - SQLite history in `/data/app.db`
 - settings persisted in `/data/config.json`
 - logs in `/data/logs/app.log`
@@ -51,14 +47,15 @@ Copy the example env file:
 cp .env.example .env
 ```
 
-Default `.env.example` values mount this Umbrel media root into the container:
+Default `.env.example` values expect the Umbrel external root to be mounted into
+the container as `/media`:
 
 ```env
 MEDIA_PATH=/home/umbrel/umbrel/external/ssd990_main
-DEFAULT_INPUT_PATH=/media/porn
-DEFAULT_OUTPUT_PATH=/media/new
-DEFAULT_FAILED_PATH=/media/failed_convert
-DEFAULT_TEMP_PATH=/media/temp_convert
+DEFAULT_INPUT_PATH=/media/ssd990_main/porn
+DEFAULT_OUTPUT_PATH=/media/ssd990_main/new
+DEFAULT_FAILED_PATH=/media/ssd990_main/failed_convert
+DEFAULT_TEMP_PATH=/media/ssd990_main/temp_convert
 ```
 
 Start the app:
@@ -85,7 +82,7 @@ docker compose exec server ffmpeg -y \
   -t 3 \
   -c:v libx264 -pix_fmt yuv420p \
   -c:a aac \
-  /media/porn/smoke.mp4
+  /media/ssd990_main/porn/smoke.mp4
 
 curl -X POST http://127.0.0.1:8080/api/scan
 curl http://127.0.0.1:8080/api/jobs
@@ -104,7 +101,7 @@ docker compose exec server ffprobe -v error \
   -select_streams v:0 \
   -show_entries stream=codec_name,width,height \
   -of default=noprint_wrappers=1 \
-  /media/new/smoke.mp4
+  /media/ssd990_main/new/smoke.mp4
 ```
 
 Expected codec:
@@ -131,12 +128,30 @@ ilya-auto-h265-video-converter
 
 The folder name and `id` in `umbrel-app.yml` must match.
 
-The compose file can build the image from this repo. If your Umbrel app store
-flow expects a prebuilt image instead, publish the Docker image to GHCR or
-Docker Hub and set:
+Before installing from Umbrel, the Docker image must exist in GHCR and be public.
+This repository includes a workflow at:
 
-```env
-AUTO_H265_IMAGE=ghcr.io/ilyasweg-ai/ilya-auto-h265-video-converter:0.1.2
+```text
+.github/workflows/build-ilya-auto-h265-video-converter.yml
+```
+
+It builds from:
+
+```text
+ilya-auto-h265-video-converter/Dockerfile
+```
+
+and publishes:
+
+```text
+ghcr.io/ilyasweg-ai/ilya-auto-h265-video-converter:<version>
+ghcr.io/ilyasweg-ai/ilya-auto-h265-video-converter:latest
+```
+
+For version `0.1.6`, Umbrel pulls:
+
+```text
+ghcr.io/ilyasweg-ai/ilya-auto-h265-video-converter:0.1.6
 ```
 
 ## API
@@ -162,10 +177,10 @@ AUTO_H265_IMAGE=ghcr.io/ilyasweg-ai/ilya-auto-h265-video-converter:0.1.2
 
 ## Defaults
 
-- input path: `/media/porn`
-- output path: `/media/new`
-- failed path: `/media/failed_convert`
-- temp path: `/media/temp_convert`
+- input path: `/media/ssd990_main/porn`
+- output path: `/media/ssd990_main/new`
+- failed path: `/media/ssd990_main/failed_convert`
+- temp path: `/media/ssd990_main/temp_convert`
 - video encoder: `libx265`
 - container: `mp4`
 - CRF: `24`
