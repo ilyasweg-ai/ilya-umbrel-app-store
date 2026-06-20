@@ -1,0 +1,21 @@
+services:
+  app_proxy:
+    environment:
+      APP_HOST: ilya-auto-h265-video-converter_server_1
+      APP_PORT: 8080
+
+  server:
+    build: .
+    image: ${AUTO_H265_IMAGE:-ilya-auto-h265-video-converter:local}
+    restart: on-failure
+    environment:
+      APP_PORT: "8080"
+      DATA_DIR: /data
+      DEFAULT_INPUT_PATH: /media/porn
+      DEFAULT_OUTPUT_PATH: /media/new
+      DEFAULT_FAILED_PATH: /media/failed_convert
+      DEFAULT_TEMP_PATH: /media/temp_convert
+      FFMPEG_THREADS: ${FFMPEG_THREADS:-0}
+    volumes:
+      - ${UMBREL_ROOT}/app-data/ilya-auto-h265-video-converter/data:/data
+      - ${UMBREL_ROOT}/external/ssd990_main:/media
