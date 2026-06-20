@@ -17,6 +17,8 @@ MP4 in the output folder.
   `python:3.12-slim` image. The compose file writes the app code into the
   container at startup, so Umbrel does not need a local Docker build or relative
   app-file bind mounts.
+- JavaScript template strings are escaped inside `docker-compose.yml` so Docker
+  Compose does not treat them as environment variables during install.
 - SQLite history in `/data/app.db`
 - settings persisted in `/data/config.json`
 - logs in `/data/logs/app.log`

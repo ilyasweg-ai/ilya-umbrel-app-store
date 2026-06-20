@@ -2,7 +2,7 @@ manifestVersion: 1
 id: ilya-auto-h265-video-converter
 category: files
 name: Auto H265 Video Converter
-version: "0.1.4"
+version: "0.1.5"
 tagline: Automatically convert H.264 videos to H.265
 icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-auto-h265-video-converter/icon.svg
 description: >-
@@ -21,6 +21,6 @@ path: ""
 defaultUsername: ""
 defaultPassword: ""
 releaseNotes: >-
-  Made docker-compose self-contained for Umbrel install by removing relative app file mounts.
+  Escaped JavaScript dollar signs in the self-contained compose command so Docker Compose does not treat them as environment variables.
 submitter: Ilya
 submission: ""
