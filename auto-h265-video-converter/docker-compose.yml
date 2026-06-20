@@ -1,18 +1,21 @@
 services:
-  auto-h265:
+  app_proxy:
+    environment:
+      APP_HOST: auto-h265-video-converter_server_1
+      APP_PORT: 8080
+
+  server:
     build: .
     image: ${AUTO_H265_IMAGE:-auto-h265-video-converter:local}
-    restart: unless-stopped
-    ports:
-      - "${APP_PORT:-8080}:8080"
+    restart: on-failure
     environment:
       APP_PORT: "8080"
       DATA_DIR: /data
-      DEFAULT_INPUT_PATH: ${DEFAULT_INPUT_PATH:-/media/input}
-      DEFAULT_OUTPUT_PATH: ${DEFAULT_OUTPUT_PATH:-/media/output}
-      DEFAULT_FAILED_PATH: ${DEFAULT_FAILED_PATH:-/media/failed}
-      DEFAULT_TEMP_PATH: ${DEFAULT_TEMP_PATH:-/media/temp}
+      DEFAULT_INPUT_PATH: /media/porn
+      DEFAULT_OUTPUT_PATH: /media/new
+      DEFAULT_FAILED_PATH: /media/failed_convert
+      DEFAULT_TEMP_PATH: /media/temp_convert
       FFMPEG_THREADS: ${FFMPEG_THREADS:-0}
     volumes:
-      - ${APP_DATA_DIR:-./data}:/data
-      - ${MEDIA_PATH:-./sample-media}:/media
+      - ${UMBREL_ROOT}/app-data/auto-h265-video-converter/data:/data
+      - ${UMBREL_ROOT}/external/ssd990_main:/media

@@ -71,7 +71,7 @@ This test creates a small H.264 file inside the container, scans it, and lets th
 worker convert it.
 
 ```bash
-docker compose exec auto-h265 ffmpeg -y \
+docker compose exec server ffmpeg -y \
   -f lavfi -i testsrc=size=640x360:rate=24 \
   -f lavfi -i sine=frequency=1000:sample_rate=48000 \
   -t 3 \
@@ -92,7 +92,7 @@ After a few seconds, the job should become `success` and the result should be:
 Check the output codec:
 
 ```bash
-docker compose exec auto-h265 ffprobe -v error \
+docker compose exec server ffprobe -v error \
   -select_streams v:0 \
   -show_entries stream=codec_name,width,height \
   -of default=noprint_wrappers=1 \

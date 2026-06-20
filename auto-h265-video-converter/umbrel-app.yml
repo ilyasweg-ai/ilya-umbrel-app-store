@@ -2,8 +2,9 @@ manifestVersion: 1
 id: auto-h265-video-converter
 category: files
 name: Auto H265 Video Converter
-version: "0.1.0"
+version: "0.1.1"
 tagline: Automatically convert H.264 videos to H.265
+icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/auto-h265-video-converter/icon.svg
 description: >-
   A minimal web app for Umbrel OS that watches a mounted media folder,
   queues video files, and converts them one at a time to HEVC/H.265 with
@@ -20,7 +21,6 @@ path: ""
 defaultUsername: ""
 defaultPassword: ""
 releaseNotes: >-
-  Initial MVP with Docker, FastAPI, SQLite, FFmpeg, queue processing,
-  progress polling, and basic Umbrel app metadata.
+  Added the required app icon URL and Umbrel app_proxy compose wiring.
 submitter: Ilya
 submission: ""
