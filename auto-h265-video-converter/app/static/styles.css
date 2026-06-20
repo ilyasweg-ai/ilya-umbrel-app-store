@@ -1,0 +1,170 @@
+:root {
+  color-scheme: light;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #f5f6f8;
+  color: #1b1f24;
+}
+
+body {
+  margin: 0;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 20px;
+  background: #ffffff;
+  border-bottom: 1px solid #d8dde5;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+h1 {
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 18px;
+  margin-bottom: 12px;
+}
+
+main {
+  padding: 20px;
+  display: grid;
+  gap: 20px;
+}
+
+button {
+  border: 1px solid #b9c0ca;
+  background: #ffffff;
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #eef3ff;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.card,
+section {
+  background: #ffffff;
+  border: 1px solid #d8dde5;
+  border-radius: 8px;
+}
+
+.card {
+  padding: 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.card span {
+  color: #5a6573;
+  font-size: 13px;
+}
+
+.card strong {
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+section {
+  padding: 16px;
+}
+
+.settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  color: #4a5563;
+  font-size: 13px;
+}
+
+input {
+  border: 1px solid #b9c0ca;
+  border-radius: 6px;
+  padding: 8px;
+  font: inherit;
+}
+
+.check {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  border-bottom: 1px solid #e2e6ed;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+td {
+  overflow-wrap: anywhere;
+}
+
+.status-success {
+  color: #167a3b;
+}
+
+.status-converting {
+  color: #1f62c7;
+}
+
+.status-failed,
+.status-moved_to_failed {
+  color: #b42318;
+}
+
+.status-pending,
+.status-waiting_file_copy,
+.status-skipped {
+  color: #946200;
+}
+
+pre {
+  max-height: 280px;
+  overflow: auto;
+  background: #101418;
+  color: #dce7f3;
+  padding: 12px;
+  border-radius: 6px;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 700px) {
+  header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

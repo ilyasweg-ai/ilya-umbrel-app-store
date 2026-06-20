@@ -1,0 +1,18 @@
+services:
+  auto-h265:
+    build: .
+    image: ${AUTO_H265_IMAGE:-auto-h265-video-converter:local}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      APP_PORT: "8080"
+      DATA_DIR: /data
+      DEFAULT_INPUT_PATH: ${DEFAULT_INPUT_PATH:-/media/input}
+      DEFAULT_OUTPUT_PATH: ${DEFAULT_OUTPUT_PATH:-/media/output}
+      DEFAULT_FAILED_PATH: ${DEFAULT_FAILED_PATH:-/media/failed}
+      DEFAULT_TEMP_PATH: ${DEFAULT_TEMP_PATH:-/media/temp}
+      FFMPEG_THREADS: ${FFMPEG_THREADS:-0}
+    volumes:
+      - ${APP_DATA_DIR:-./data}:/data
+      - ${MEDIA_PATH:-./sample-media}:/media
