@@ -7,7 +7,6 @@ services:
   server:
     image: python:3.12-slim
     restart: on-failure
-    working_dir: /app
     environment:
       APP_PORT: "8080"
       DATA_DIR: /data
@@ -19,15 +18,1524 @@ services:
     volumes:
       - ${UMBREL_ROOT}/app-data/ilya-auto-h265-video-converter/data:/data
       - ${UMBREL_ROOT}/external/ssd990_main:/media
-      - ./app:/app/app:ro
-      - ./requirements.txt:/app/requirements.txt:ro
     command:
       - sh
       - -c
       - |
         set -e
-        apt-get update
-        apt-get install -y --no-install-recommends ffmpeg ca-certificates
-        rm -rf /var/lib/apt/lists/*
+        mkdir -p /app/app/static /data /media/porn /media/new /media/failed_convert /media/temp_convert
+        cat > /app/requirements.txt <<'REQS'
+        fastapi>=0.110,<1
+        uvicorn>=0.27,<1
+        REQS
+        cat > /app/app/__init__.py <<'PY_INIT'
+        __version__ = "0.1.0"
+        PY_INIT
+        cat > /app/app/config.py <<'PY_CONFIG'
+        from __future__ import annotations
+        
+        import json
+        import os
+        import threading
+        from dataclasses import asdict, dataclass, field
+        from pathlib import Path
+        from typing import Any
+        
+        
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        
+        
+        def _env_int(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                return default
+        
+        
+        @dataclass
+        class Settings:
+            input_path: str = field(default_factory=lambda: os.getenv("DEFAULT_INPUT_PATH", "/media/input"))
+            output_path: str = field(default_factory=lambda: os.getenv("DEFAULT_OUTPUT_PATH", "/media/output"))
+            failed_path: str = field(default_factory=lambda: os.getenv("DEFAULT_FAILED_PATH", "/media/failed"))
+            temp_path: str = field(default_factory=lambda: os.getenv("DEFAULT_TEMP_PATH", "/media/temp"))
+            use_temp_path: bool = field(default_factory=lambda: _env_bool("USE_TEMP_PATH", False))
+            worker_enabled: bool = True
+            auto_convert_enabled: bool = True
+            recursive_scan: bool = True
+            scan_interval_seconds: int = 5
+            stable_file_seconds: int = 1
+            max_retries: int = 1
+            allowed_extensions: list[str] = field(
+                default_factory=lambda: [".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm"]
+            )
+            video_encoder: str = "libx265"
+            container: str = "mp4"
+            crf: int = 24
+            preset: str = "medium"
+            max_width: int = 4096
+            max_height: int = 2048
+            pixel_format: str = "yuv420p"
+            audio_codec: str = "aac"
+            audio_bitrate: str = "160k"
+            ffmpeg_threads: int = field(default_factory=lambda: _env_int("FFMPEG_THREADS", 0))
+            already_hevc_action: str = "skip"
+        
+            def normalized(self) -> "Settings":
+                self.input_path = str(Path(self.input_path))
+                self.output_path = str(Path(self.output_path))
+                self.failed_path = str(Path(self.failed_path))
+                self.temp_path = str(Path(self.temp_path))
+                self.scan_interval_seconds = max(1, int(self.scan_interval_seconds))
+                self.stable_file_seconds = max(0, int(self.stable_file_seconds))
+                self.max_retries = max(1, int(self.max_retries))
+                self.crf = min(32, max(18, int(self.crf)))
+                self.max_width = max(2, int(self.max_width))
+                self.max_height = max(2, int(self.max_height))
+                self.ffmpeg_threads = max(0, int(self.ffmpeg_threads))
+                self.allowed_extensions = [
+                    ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+                    for ext in self.allowed_extensions
+                    if str(ext).strip()
+                ]
+                if not self.allowed_extensions:
+                    self.allowed_extensions = [".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm"]
+                if self.preset not in {
+                    "ultrafast",
+                    "superfast",
+                    "veryfast",
+                    "faster",
+                    "fast",
+                    "medium",
+                    "slow",
+                    "slower",
+                    "veryslow",
+                }:
+                    self.preset = "medium"
+                if self.already_hevc_action not in {"skip", "copy"}:
+                    self.already_hevc_action = "skip"
+                return self
+        
+        
+        class SettingsStore:
+            def __init__(self, data_dir: Path) -> None:
+                self.data_dir = data_dir
+                self.path = data_dir / "config.json"
+                self._lock = threading.RLock()
+                self._settings = self._load()
+        
+            def _load(self) -> Settings:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                settings = Settings()
+                if self.path.exists():
+                    with self.path.open("r", encoding="utf-8") as fh:
+                        raw = json.load(fh)
+                    for key, value in raw.items():
+                        if hasattr(settings, key):
+                            setattr(settings, key, value)
+                settings.normalized()
+                self._ensure_paths(settings)
+                self._write(settings)
+                return settings
+        
+            def _write(self, settings: Settings) -> None:
+                tmp = self.path.with_suffix(".json.tmp")
+                with tmp.open("w", encoding="utf-8") as fh:
+                    json.dump(asdict(settings), fh, indent=2, sort_keys=True)
+                tmp.replace(self.path)
+        
+            def _ensure_paths(self, settings: Settings) -> None:
+                for value in {
+                    settings.input_path,
+                    settings.output_path,
+                    settings.failed_path,
+                    settings.temp_path,
+                }:
+                    Path(value).mkdir(parents=True, exist_ok=True)
+        
+            def get(self) -> Settings:
+                with self._lock:
+                    return Settings(**asdict(self._settings)).normalized()
+        
+            def as_dict(self) -> dict[str, Any]:
+                return asdict(self.get())
+        
+            def update(self, patch: dict[str, Any]) -> Settings:
+                with self._lock:
+                    data = asdict(self._settings)
+                    for key, value in patch.items():
+                        if key in data:
+                            data[key] = value
+                    settings = Settings(**data).normalized()
+                    self._ensure_paths(settings)
+                    self._write(settings)
+                    self._settings = settings
+                    return self.get()
+        
+        PY_CONFIG
+        cat > /app/app/db.py <<'PY_DB'
+        from __future__ import annotations
+        
+        import sqlite3
+        from contextlib import contextmanager
+        from pathlib import Path
+        from typing import Any, Iterable
+        
+        
+        ACTIVE_STATUSES = ("pending", "waiting_file_copy", "probing", "converting")
+        
+        
+        def utc_now() -> str:
+            from datetime import datetime, timezone
+        
+            return datetime.now(timezone.utc).isoformat()
+        
+        
+        class Database:
+            def __init__(self, db_path: Path) -> None:
+                self.db_path = db_path
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+            @contextmanager
+            def connect(self) -> Iterable[sqlite3.Connection]:
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                try:
+                    yield conn
+                    conn.commit()
+                finally:
+                    conn.close()
+        
+            def init(self) -> None:
+                with self.connect() as conn:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS jobs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            source_path TEXT NOT NULL UNIQUE,
+                            output_path TEXT,
+                            temp_output_path TEXT,
+                            status TEXT NOT NULL DEFAULT 'pending',
+                            source_codec TEXT,
+                            source_width INTEGER,
+                            source_height INTEGER,
+                            source_duration REAL,
+                            source_size_bytes INTEGER,
+                            output_size_bytes INTEGER,
+                            progress_percent REAL NOT NULL DEFAULT 0,
+                            fps REAL,
+                            speed TEXT,
+                            eta_seconds REAL,
+                            started_at TEXT,
+                            finished_at TEXT,
+                            elapsed_seconds REAL,
+                            error_message TEXT,
+                            retry_count INTEGER NOT NULL DEFAULT 0,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            last_seen_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                           SET status = 'pending',
+                               progress_percent = 0,
+                               updated_at = ?
+                         WHERE status IN ('probing', 'converting')
+                        """,
+                        (now,),
+                    )
+        
+            def add_or_touch_job(self, source_path: str, source_size: int, status: str) -> bool:
+                now = utc_now()
+                with self.connect() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO jobs (
+                            source_path, status, source_size_bytes,
+                            created_at, updated_at, last_seen_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (source_path, status, source_size, now, now, now),
+                    )
+                    inserted = cur.rowcount > 0
+                    if not inserted:
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                               SET last_seen_at = ?,
+                                   source_size_bytes = COALESCE(source_size_bytes, ?)
+                             WHERE source_path = ?
+                            """,
+                            (now, source_size, source_path),
+                        )
+                    return inserted
+        
+            def promote_waiting(self, source_path: str) -> None:
+                self.update_job(source_path=source_path, status="pending", progress_percent=0)
+        
+            def update_job(self, job_id: int | None = None, source_path: str | None = None, **fields: Any) -> None:
+                if not fields:
+                    return
+                fields["updated_at"] = utc_now()
+                names = ", ".join(f"{key} = ?" for key in fields)
+                values = list(fields.values())
+                if job_id is not None:
+                    where = "id = ?"
+                    values.append(job_id)
+                elif source_path is not None:
+                    where = "source_path = ?"
+                    values.append(source_path)
+                else:
+                    raise ValueError("job_id or source_path is required")
+                with self.connect() as conn:
+                    conn.execute(f"UPDATE jobs SET {names} WHERE {where}", values)
+        
+            def get_next_job(self) -> dict[str, Any] | None:
+                with self.connect() as conn:
+                    row = conn.execute(
+                        """
+                        SELECT *
+                          FROM jobs
+                         WHERE status = 'pending'
+                         ORDER BY created_at ASC
+                         LIMIT 1
+                        """
+                    ).fetchone()
+                    return dict(row) if row else None
+        
+            def get_job(self, job_id: int) -> dict[str, Any] | None:
+                with self.connect() as conn:
+                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                    return dict(row) if row else None
+        
+            def list_jobs(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+                with self.connect() as conn:
+                    if status:
+                        rows = conn.execute(
+                            "SELECT * FROM jobs WHERE status = ? ORDER BY id DESC LIMIT ?",
+                            (status, limit),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                    return [dict(row) for row in rows]
+        
+            def waiting_jobs(self) -> list[dict[str, Any]]:
+                with self.connect() as conn:
+                    rows = conn.execute("SELECT * FROM jobs WHERE status = 'waiting_file_copy'").fetchall()
+                    return [dict(row) for row in rows]
+        
+            def stats(self) -> dict[str, Any]:
+                with self.connect() as conn:
+                    rows = conn.execute("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status").fetchall()
+                    counts = {row["status"]: row["count"] for row in rows}
+                    sums = conn.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status IN ('success', 'skipped') THEN source_size_bytes ELSE 0 END), 0)
+                                AS source_bytes,
+                            COALESCE(SUM(CASE WHEN status = 'success' THEN output_size_bytes ELSE 0 END), 0)
+                                AS output_bytes
+                          FROM jobs
+                        """
+                    ).fetchone()
+                    total = conn.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"]
+                source_bytes = int(sums["source_bytes"] or 0)
+                output_bytes = int(sums["output_bytes"] or 0)
+                saved_bytes = max(0, source_bytes - output_bytes)
+                saved_percent = (saved_bytes / source_bytes * 100) if source_bytes else 0
+                processed = sum(counts.get(name, 0) for name in ("success", "skipped", "failed", "moved_to_failed"))
+                pending = sum(counts.get(name, 0) for name in ("pending", "waiting_file_copy", "probing", "converting"))
+                return {
+                    "total_jobs": total,
+                    "processed_jobs": processed,
+                    "pending_jobs": pending,
+                    "success_jobs": counts.get("success", 0),
+                    "failed_jobs": counts.get("failed", 0) + counts.get("moved_to_failed", 0),
+                    "skipped_jobs": counts.get("skipped", 0),
+                    "source_bytes": source_bytes,
+                    "output_bytes": output_bytes,
+                    "saved_bytes": saved_bytes,
+                    "saved_percent": round(saved_percent, 2),
+                    "by_status": counts,
+                }
+        
+        PY_DB
+        cat > /app/app/ffmpeg_runner.py <<'PY_FFMPEG'
+        from __future__ import annotations
+        
+        import json
+        import os
+        import re
+        import subprocess
+        from dataclasses import dataclass
+        from pathlib import Path
+        from typing import Any
+        
+        from .config import Settings
+        
+        
+        @dataclass
+        class VideoProbe:
+            codec: str
+            width: int
+            height: int
+            duration: float
+            size_bytes: int
+        
+        
+        def parse_progress_line(line: str) -> tuple[str, str] | None:
+            line = line.strip()
+            if not line or "=" not in line:
+                return None
+            key, value = line.split("=", 1)
+            return key.strip(), value.strip()
+        
+        
+        def progress_from_out_time(out_time_ms: str, duration: float) -> float:
+            if duration <= 0:
+                return 0.0
+            try:
+                seconds = int(out_time_ms) / 1_000_000
+            except ValueError:
+                return 0.0
+            return min(99.9, max(0.0, seconds / duration * 100))
+        
+        
+        def safe_float(raw: Any, default: float = 0.0) -> float:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+        
+        
+        def probe_video(path: Path, ffprobe_bin: str = "ffprobe") -> VideoProbe:
+            cmd = [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,duration",
+                "-show_entries",
+                "format=duration,size",
+                "-of",
+                "json",
+                str(path),
+            ]
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            payload = json.loads(result.stdout or "{}")
+            streams = payload.get("streams") or []
+            if not streams:
+                raise RuntimeError("No video stream found")
+            stream = streams[0]
+            fmt = payload.get("format") or {}
+            duration = safe_float(stream.get("duration"), safe_float(fmt.get("duration"), 0))
+            size = int(safe_float(fmt.get("size"), path.stat().st_size))
+            return VideoProbe(
+                codec=str(stream.get("codec_name") or "unknown").lower(),
+                width=int(stream.get("width") or 0),
+                height=int(stream.get("height") or 0),
+                duration=duration,
+                size_bytes=size,
+            )
+        
+        
+        def needs_scaling(probe: VideoProbe, settings: Settings) -> bool:
+            return probe.width > settings.max_width or probe.height > settings.max_height
+        
+        
+        def video_filter(probe: VideoProbe, settings: Settings) -> str:
+            if needs_scaling(probe, settings):
+                return (
+                    f"scale='min({settings.max_width},iw)':'min({settings.max_height},ih)'"
+                    f":force_original_aspect_ratio=decrease:force_divisible_by=2,format={settings.pixel_format}"
+                )
+            return f"format={settings.pixel_format}"
+        
+        
+        def unique_path(path: Path) -> Path:
+            if not path.exists():
+                return path
+            stem = path.stem
+            suffix = path.suffix
+            parent = path.parent
+            for index in range(1, 10_000):
+                candidate = parent / f"{stem}-{index}{suffix}"
+                if not candidate.exists():
+                    return candidate
+            raise RuntimeError(f"Cannot find unique path for {path}")
+        
+        
+        def output_path_for(source: Path, settings: Settings) -> Path:
+            output_dir = Path(settings.output_path)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return unique_path(output_dir / f"{source.stem}.{settings.container}")
+        
+        
+        def temp_path_for(output_path: Path, settings: Settings) -> Path:
+            if settings.use_temp_path:
+                temp_dir = Path(settings.temp_path)
+                temp_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                temp_dir = output_path.parent
+            return unique_path(temp_dir / f"{output_path.stem}.tmp{output_path.suffix}")
+        
+        
+        def build_ffmpeg_command(source: Path, temp_output: Path, probe: VideoProbe, settings: Settings) -> list[str]:
+            container = settings.container.lower()
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-map_metadata",
+                "0",
+                "-map_chapters",
+                "0",
+                "-vf",
+                video_filter(probe, settings),
+                "-c:v",
+                settings.video_encoder,
+                "-preset",
+                settings.preset,
+                "-crf",
+                str(settings.crf),
+                "-pix_fmt",
+                settings.pixel_format,
+                "-c:a",
+                settings.audio_codec,
+                "-b:a",
+                settings.audio_bitrate,
+            ]
+            if settings.ffmpeg_threads:
+                cmd.extend(["-threads", str(settings.ffmpeg_threads)])
+            if container in {"mp4", "mov", "m4v"}:
+                cmd.extend(["-tag:v", "hvc1", "-movflags", "+faststart"])
+            cmd.extend(["-progress", "pipe:1", "-nostats", str(temp_output)])
+            return cmd
+        
+        
+        def parse_speed(raw: str) -> str:
+            return raw.strip() if raw else ""
+        
+        
+        def parse_fps(raw: str) -> float | None:
+            match = re.match(r"^([0-9.]+)", raw.strip())
+            if not match:
+                return None
+            return safe_float(match.group(1), 0)
+        
+        
+        def replace_or_move(source: Path, destination: Path) -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(source, destination)
+            except OSError:
+                import shutil
+        
+                shutil.move(str(source), str(destination))
+        PY_FFMPEG
+        cat > /app/app/worker.py <<'PY_WORKER'
+        from __future__ import annotations
+        
+        import logging
+        import shutil
+        import subprocess
+        import threading
+        import time
+        from dataclasses import asdict
+        from pathlib import Path
+        from typing import Any
+        
+        from .config import Settings, SettingsStore
+        from .db import Database, utc_now
+        from .ffmpeg_runner import (
+            build_ffmpeg_command,
+            output_path_for,
+            parse_fps,
+            parse_progress_line,
+            parse_speed,
+            probe_video,
+            progress_from_out_time,
+            replace_or_move,
+            temp_path_for,
+            unique_path,
+        )
+        
+        
+        class Worker:
+            def __init__(self, settings_store: SettingsStore, db: Database, logger: logging.Logger) -> None:
+                self.settings_store = settings_store
+                self.db = db
+                self.logger = logger
+                self._thread: threading.Thread | None = None
+                self._stop = threading.Event()
+                self._lock = threading.RLock()
+                self._current_job_id: int | None = None
+                self._last_scan_at: str | None = None
+                self._last_error: str | None = None
+        
+            def start_thread(self) -> None:
+                with self._lock:
+                    if self._thread and self._thread.is_alive():
+                        return
+                    self._stop.clear()
+                    self._thread = threading.Thread(target=self._loop, name="auto-h265-worker", daemon=True)
+                    self._thread.start()
+                    self.logger.info("Worker thread started")
+        
+            def stop_thread(self) -> None:
+                self._stop.set()
+                if self._thread and self._thread.is_alive():
+                    self._thread.join(timeout=5)
+        
+            def status(self) -> dict[str, Any]:
+                settings = self.settings_store.get()
+                thread_alive = bool(self._thread and self._thread.is_alive())
+                return {
+                    "thread_alive": thread_alive,
+                    "worker_enabled": settings.worker_enabled,
+                    "auto_convert_enabled": settings.auto_convert_enabled,
+                    "current_job_id": self._current_job_id,
+                    "last_scan_at": self._last_scan_at,
+                    "last_error": self._last_error,
+                }
+        
+            def enable_worker(self) -> Settings:
+                settings = self.settings_store.update({"worker_enabled": True})
+                self.start_thread()
+                return settings
+        
+            def disable_worker(self) -> Settings:
+                return self.settings_store.update({"worker_enabled": False})
+        
+            def pause_auto_convert(self) -> Settings:
+                return self.settings_store.update({"auto_convert_enabled": False})
+        
+            def resume_auto_convert(self) -> Settings:
+                self.start_thread()
+                return self.settings_store.update({"auto_convert_enabled": True, "worker_enabled": True})
+        
+            def _loop(self) -> None:
+                while not self._stop.is_set():
+                    try:
+                        settings = self.settings_store.get()
+                        if settings.worker_enabled and settings.auto_convert_enabled:
+                            self.promote_waiting(settings)
+                            self.scan_once(settings)
+                            self.process_next(settings)
+                        time.sleep(settings.scan_interval_seconds)
+                    except Exception as exc:
+                        self._last_error = str(exc)
+                        self.logger.exception("Worker loop failed: %s", exc)
+                        time.sleep(5)
+        
+            def scan_once(self, settings: Settings | None = None) -> dict[str, Any]:
+                settings = settings or self.settings_store.get()
+                input_dir = Path(settings.input_path)
+                input_dir.mkdir(parents=True, exist_ok=True)
+                found = 0
+                inserted = 0
+                pattern_iter = input_dir.rglob("*") if settings.recursive_scan else input_dir.glob("*")
+                now = time.time()
+                for path in pattern_iter:
+                    try:
+                        if not path.is_file():
+                            continue
+                        if path.suffix.lower() not in settings.allowed_extensions:
+                            continue
+                        if ".tmp" in path.name:
+                            continue
+                        stat = path.stat()
+                        age = now - stat.st_mtime
+                        status = "pending" if age >= settings.stable_file_seconds else "waiting_file_copy"
+                        if self.db.add_or_touch_job(str(path.resolve()), stat.st_size, status):
+                            inserted += 1
+                        found += 1
+                    except OSError as exc:
+                        self.logger.warning("Cannot scan %s: %s", path, exc)
+                self._last_scan_at = utc_now()
+                if inserted:
+                    self.logger.info("Scan found %s new file(s)", inserted)
+                return {"found": found, "inserted": inserted, "scanned_at": self._last_scan_at}
+        
+            def promote_waiting(self, settings: Settings | None = None) -> int:
+                settings = settings or self.settings_store.get()
+                promoted = 0
+                now = time.time()
+                for job in self.db.waiting_jobs():
+                    path = Path(job["source_path"])
+                    try:
+                        if path.exists() and now - path.stat().st_mtime >= settings.stable_file_seconds:
+                            self.db.promote_waiting(str(path.resolve()))
+                            promoted += 1
+                    except OSError:
+                        continue
+                return promoted
+        
+            def process_next(self, settings: Settings | None = None) -> bool:
+                settings = settings or self.settings_store.get()
+                job = self.db.get_next_job()
+                if not job:
+                    return False
+                self.process_job(job, settings)
+                return True
+        
+            def process_job(self, job: dict[str, Any], settings: Settings) -> None:
+                job_id = int(job["id"])
+                source = Path(job["source_path"])
+                started = time.time()
+                self._current_job_id = job_id
+                self.db.update_job(job_id=job_id, status="probing", started_at=utc_now(), error_message=None)
+                self.logger.info("Processing job %s: %s", job_id, source)
+                try:
+                    if not source.exists():
+                        raise RuntimeError("Source file disappeared")
+                    probe = probe_video(source)
+                    self.db.update_job(
+                        job_id=job_id,
+                        source_codec=probe.codec,
+                        source_width=probe.width,
+                        source_height=probe.height,
+                        source_duration=probe.duration,
+                        source_size_bytes=probe.size_bytes,
+                    )
+                    if probe.codec in {"hevc", "h265"} and probe.width <= settings.max_width and probe.height <= settings.max_height:
+                        self._handle_already_hevc(job_id, source, probe.size_bytes, settings)
+                        return
+                    self._convert(job_id, source, probe, settings, started)
+                except Exception as exc:
+                    self._handle_failure(job, source, settings, exc, started)
+                finally:
+                    self._current_job_id = None
+        
+            def _handle_already_hevc(self, job_id: int, source: Path, source_size: int, settings: Settings) -> None:
+                if settings.already_hevc_action == "copy":
+                    output = unique_path(Path(settings.output_path) / source.name)
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, output)
+                    status = "success"
+                    output_size = output.stat().st_size
+                    output_path = str(output)
+                else:
+                    status = "skipped"
+                    output_size = 0
+                    output_path = None
+                self.db.update_job(
+                    job_id=job_id,
+                    status=status,
+                    output_path=output_path,
+                    output_size_bytes=output_size,
+                    progress_percent=100,
+                    finished_at=utc_now(),
+                    error_message=None,
+                    elapsed_seconds=0,
+                )
+                self.logger.info("Job %s %s because source is already HEVC", job_id, status)
+        
+            def _convert(self, job_id: int, source: Path, probe: Any, settings: Settings, started: float) -> None:
+                output = output_path_for(source, settings)
+                temp_output = temp_path_for(output, settings)
+                self.db.update_job(
+                    job_id=job_id,
+                    status="converting",
+                    output_path=str(output),
+                    temp_output_path=str(temp_output),
+                    progress_percent=0,
+                )
+                cmd = build_ffmpeg_command(source, temp_output, probe, settings)
+                self.logger.info("Starting FFmpeg for job %s", job_id)
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                log_tail: list[str] = []
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    parsed = parse_progress_line(raw_line)
+                    if parsed is None:
+                        clean = raw_line.strip()
+                        if clean:
+                            log_tail = (log_tail + [clean])[-20:]
+                        continue
+                    key, value = parsed
+                    patch: dict[str, Any] = {"elapsed_seconds": round(time.time() - started, 2)}
+                    if key == "out_time_ms":
+                        percent = progress_from_out_time(value, float(probe.duration or 0))
+                        patch["progress_percent"] = round(percent, 2)
+                        if percent > 0:
+                            elapsed = time.time() - started
+                            remaining = elapsed * (100 - percent) / percent
+                            patch["eta_seconds"] = round(max(0, remaining), 2)
+                    elif key == "fps":
+                        patch["fps"] = parse_fps(value)
+                    elif key == "speed":
+                        patch["speed"] = parse_speed(value)
+                    elif key == "progress" and value == "end":
+                        patch["progress_percent"] = 100
+                        patch["eta_seconds"] = 0
+                    self.db.update_job(job_id=job_id, **patch)
+                return_code = process.wait()
+                if return_code != 0:
+                    detail = "; ".join(log_tail[-5:]) or f"ffmpeg exited with {return_code}"
+                    raise RuntimeError(detail)
+                if not temp_output.exists():
+                    raise RuntimeError("FFmpeg finished but output file is missing")
+                replace_or_move(temp_output, output)
+                output_size = output.stat().st_size
+                self.db.update_job(
+                    job_id=job_id,
+                    status="success",
+                    output_path=str(output),
+                    temp_output_path=None,
+                    output_size_bytes=output_size,
+                    progress_percent=100,
+                    eta_seconds=0,
+                    finished_at=utc_now(),
+                    elapsed_seconds=round(time.time() - started, 2),
+                    error_message=None,
+                )
+                self.logger.info("Job %s completed: %s", job_id, output)
+        
+            def _handle_failure(
+                self,
+                job: dict[str, Any],
+                source: Path,
+                settings: Settings,
+                exc: Exception,
+                started: float,
+            ) -> None:
+                job_id = int(job["id"])
+                latest_job = self.db.get_job(job_id) or job
+                retry_count = int(latest_job.get("retry_count") or 0) + 1
+                message = str(exc)
+                self._last_error = message
+                temp_output = latest_job.get("temp_output_path")
+                if temp_output:
+                    try:
+                        Path(temp_output).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if retry_count >= settings.max_retries:
+                    failed_path = self._move_to_failed(source, settings)
+                    self.db.update_job(
+                        job_id=job_id,
+                        source_path=str(failed_path) if failed_path else str(source),
+                        status="moved_to_failed" if failed_path else "failed",
+                        retry_count=retry_count,
+                        progress_percent=0,
+                        finished_at=utc_now(),
+                        elapsed_seconds=round(time.time() - started, 2),
+                        error_message=message,
+                    )
+                    self.logger.error("Job %s failed and moved to quarantine: %s", job_id, message)
+                else:
+                    self.db.update_job(
+                        job_id=job_id,
+                        status="pending",
+                        retry_count=retry_count,
+                        progress_percent=0,
+                        error_message=message,
+                    )
+                    self.logger.warning("Job %s failed, retry %s/%s: %s", job_id, retry_count, settings.max_retries, message)
+        
+            def _move_to_failed(self, source: Path, settings: Settings) -> Path | None:
+                if not source.exists():
+                    return None
+                failed_dir = Path(settings.failed_path)
+                failed_dir.mkdir(parents=True, exist_ok=True)
+                destination = unique_path(failed_dir / source.name)
+                shutil.move(str(source), str(destination))
+                return destination
+        
+            def retry_job(self, job_id: int) -> dict[str, Any]:
+                job = self.db.get_job(job_id)
+                if not job:
+                    raise KeyError(job_id)
+                self.db.update_job(
+                    job_id=job_id,
+                    status="pending",
+                    retry_count=0,
+                    progress_percent=0,
+                    error_message=None,
+                    finished_at=None,
+                )
+                return self.db.get_job(job_id) or {}
+        
+            def skip_job(self, job_id: int) -> dict[str, Any]:
+                job = self.db.get_job(job_id)
+                if not job:
+                    raise KeyError(job_id)
+                self.db.update_job(job_id=job_id, status="skipped", progress_percent=100, finished_at=utc_now())
+                return self.db.get_job(job_id) or {}
+        
+            def move_job_to_failed(self, job_id: int) -> dict[str, Any]:
+                job = self.db.get_job(job_id)
+                if not job:
+                    raise KeyError(job_id)
+                settings = self.settings_store.get()
+                failed_path = self._move_to_failed(Path(job["source_path"]), settings)
+                self.db.update_job(
+                    job_id=job_id,
+                    source_path=str(failed_path) if failed_path else job["source_path"],
+                    status="moved_to_failed",
+                    finished_at=utc_now(),
+                )
+                return self.db.get_job(job_id) or {}
+        PY_WORKER
+        cat > /app/app/main.py <<'PY_MAIN'
+        from __future__ import annotations
+        
+        import logging
+        import os
+        from pathlib import Path
+        from typing import Any
+        
+        from fastapi import FastAPI, HTTPException, Query
+        from fastapi.responses import FileResponse, PlainTextResponse
+        from fastapi.staticfiles import StaticFiles
+        
+        from . import __version__
+        from .config import SettingsStore
+        from .db import Database
+        from .worker import Worker
+        
+        
+        DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+        LOG_DIR = DATA_DIR / "logs"
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8"),
+            ],
+        )
+        logger = logging.getLogger("auto_h265")
+        
+        settings_store = SettingsStore(DATA_DIR)
+        db = Database(DATA_DIR / "app.db")
+        worker = Worker(settings_store, db, logger)
+        
+        app = FastAPI(title="Auto H265 Video Converter", version=__version__)
+        static_dir = Path(__file__).parent / "static"
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+        
+        
+        @app.on_event("startup")
+        def on_startup() -> None:
+            db.init()
+            worker.start_thread()
+        
+        
+        @app.on_event("shutdown")
+        def on_shutdown() -> None:
+            worker.stop_thread()
+        
+        
+        @app.get("/")
+        def index() -> FileResponse:
+            return FileResponse(static_dir / "index.html")
+        
+        
+        @app.get("/api/health")
+        def health() -> dict[str, Any]:
+            return {"ok": True, "version": __version__, "worker": worker.status()}
+        
+        
+        @app.get("/api/version")
+        def version() -> dict[str, str]:
+            return {"version": __version__}
+        
+        
+        @app.get("/api/settings")
+        def get_settings() -> dict[str, Any]:
+            return settings_store.as_dict()
+        
+        
+        @app.put("/api/settings")
+        def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
+            return settings_store.update(patch).__dict__
+        
+        
+        @app.post("/api/worker/start")
+        def worker_start() -> dict[str, Any]:
+            settings = worker.enable_worker()
+            return {"ok": True, "settings": settings.__dict__, "worker": worker.status()}
+        
+        
+        @app.post("/api/worker/stop")
+        def worker_stop() -> dict[str, Any]:
+            settings = worker.disable_worker()
+            return {"ok": True, "settings": settings.__dict__, "worker": worker.status()}
+        
+        
+        @app.post("/api/worker/pause")
+        def worker_pause() -> dict[str, Any]:
+            settings = worker.pause_auto_convert()
+            return {"ok": True, "settings": settings.__dict__, "worker": worker.status()}
+        
+        
+        @app.post("/api/worker/resume")
+        def worker_resume() -> dict[str, Any]:
+            settings = worker.resume_auto_convert()
+            return {"ok": True, "settings": settings.__dict__, "worker": worker.status()}
+        
+        
+        @app.post("/api/worker/restart")
+        def worker_restart() -> dict[str, Any]:
+            worker.disable_worker()
+            settings = worker.enable_worker()
+            return {"ok": True, "settings": settings.__dict__, "worker": worker.status()}
+        
+        
+        @app.post("/api/scan")
+        def scan_now() -> dict[str, Any]:
+            return worker.scan_once()
+        
+        
+        @app.get("/api/scan/status")
+        def scan_status() -> dict[str, Any]:
+            status = worker.status()
+            return {
+                "last_scan_at": status.get("last_scan_at"),
+                "worker_enabled": status.get("worker_enabled"),
+                "auto_convert_enabled": status.get("auto_convert_enabled"),
+            }
+        
+        
+        @app.get("/api/jobs")
+        def list_jobs(
+            status: str | None = Query(default=None),
+            limit: int = Query(default=100, ge=1, le=500),
+        ) -> list[dict[str, Any]]:
+            return db.list_jobs(status=status, limit=limit)
+        
+        
+        @app.get("/api/jobs/{job_id}")
+        def get_job(job_id: int) -> dict[str, Any]:
+            job = db.get_job(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="Job not found")
+            return job
+        
+        
+        @app.post("/api/jobs/{job_id}/retry")
+        def retry_job(job_id: int) -> dict[str, Any]:
+            try:
+                return worker.retry_job(job_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Job not found")
+        
+        
+        @app.post("/api/jobs/{job_id}/skip")
+        def skip_job(job_id: int) -> dict[str, Any]:
+            try:
+                return worker.skip_job(job_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Job not found")
+        
+        
+        @app.post("/api/jobs/{job_id}/move-to-failed")
+        def move_to_failed(job_id: int) -> dict[str, Any]:
+            try:
+                return worker.move_job_to_failed(job_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Job not found")
+        
+        
+        @app.get("/api/stats")
+        def stats() -> dict[str, Any]:
+            return db.stats()
+        
+        
+        @app.get("/api/progress")
+        def progress() -> dict[str, Any]:
+            current = None
+            current_id = worker.status().get("current_job_id")
+            if current_id:
+                current = db.get_job(int(current_id))
+            return {
+                "worker": worker.status(),
+                "current": current,
+                "stats": db.stats(),
+                "settings": settings_store.as_dict(),
+            }
+        
+        
+        @app.get("/api/logs")
+        def logs(lines: int = Query(default=200, ge=1, le=2000)) -> PlainTextResponse:
+            path = LOG_DIR / "app.log"
+            if not path.exists():
+                return PlainTextResponse("")
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                tail = fh.readlines()[-lines:]
+            return PlainTextResponse("".join(tail))
+        PY_MAIN
+        cat > /app/app/static/index.html <<'HTML_INDEX'
+        <!doctype html>
+        <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>Auto H265 Video Converter</title>
+            <link rel="stylesheet" href="/static/styles.css" />
+          </head>
+          <body>
+            <header>
+              <h1>Auto H265 Video Converter</h1>
+              <div class="actions">
+                <button data-action="start">Start</button>
+                <button data-action="stop">Stop</button>
+                <button data-action="pause">Pause</button>
+                <button data-action="resume">Resume</button>
+                <button id="scan-now">Scan now</button>
+              </div>
+            </header>
+        
+            <main>
+              <section class="grid">
+                <div class="card">
+                  <span>Status</span>
+                  <strong id="service-status">Loading</strong>
+                </div>
+                <div class="card">
+                  <span>Current file</span>
+                  <strong id="current-file">-</strong>
+                </div>
+                <div class="card">
+                  <span>Progress</span>
+                  <strong id="current-progress">0%</strong>
+                </div>
+                <div class="card">
+                  <span>Queue</span>
+                  <strong id="queue-count">0 / 0</strong>
+                </div>
+                <div class="card">
+                  <span>Saved</span>
+                  <strong id="saved">0 B</strong>
+                </div>
+                <div class="card">
+                  <span>Errors</span>
+                  <strong id="errors">0</strong>
+                </div>
+              </section>
+        
+              <section>
+                <h2>Settings</h2>
+                <form id="settings-form" class="settings">
+                  <label>Input path <input name="input_path" /></label>
+                  <label>Output path <input name="output_path" /></label>
+                  <label>Failed path <input name="failed_path" /></label>
+                  <label>Temp path <input name="temp_path" /></label>
+                  <label>CRF <input name="crf" type="number" min="18" max="32" /></label>
+                  <label>Preset <input name="preset" /></label>
+                  <label>Max width <input name="max_width" type="number" /></label>
+                  <label>Max height <input name="max_height" type="number" /></label>
+                  <label>Scan interval <input name="scan_interval_seconds" type="number" min="1" /></label>
+                  <label>FFmpeg threads <input name="ffmpeg_threads" type="number" min="0" /></label>
+                  <label class="check"><input name="use_temp_path" type="checkbox" /> Use temp path</label>
+                  <label class="check"><input name="recursive_scan" type="checkbox" /> Recursive scan</label>
+                  <label class="check"><input name="auto_convert_enabled" type="checkbox" /> Auto convert</label>
+                  <button type="submit">Save settings</button>
+                </form>
+              </section>
+        
+              <section>
+                <h2>Queue</h2>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>File</th>
+                      <th>Status</th>
+                      <th>Codec</th>
+                      <th>Size</th>
+                      <th>Progress</th>
+                      <th>FPS</th>
+                      <th>Speed</th>
+                      <th>Error</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="jobs"></tbody>
+                </table>
+              </section>
+        
+              <section>
+                <h2>Logs</h2>
+                <pre id="logs"></pre>
+              </section>
+            </main>
+        
+            <script src="/static/app.js"></script>
+          </body>
+        </html>
+        HTML_INDEX
+        cat > /app/app/static/app.js <<'JS_APP'
+        const state = {
+          settingsLoaded: false,
+        };
+        
+        const $ = (selector) => document.querySelector(selector);
+        
+        async function api(path, options = {}) {
+          const response = await fetch(path, {
+            headers: { "Content-Type": "application/json" },
+            ...options,
+          });
+          if (!response.ok) {
+            throw new Error(await response.text());
+          }
+          const type = response.headers.get("content-type") || "";
+          return type.includes("application/json") ? response.json() : response.text();
+        }
+        
+        function formatBytes(value) {
+          const bytes = Number(value || 0);
+          if (bytes < 1024) return `${bytes} B`;
+          const units = ["KB", "MB", "GB", "TB"];
+          let size = bytes / 1024;
+          let index = 0;
+          while (size >= 1024 && index < units.length - 1) {
+            size /= 1024;
+            index += 1;
+          }
+          return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+        }
+        
+        function fileName(path) {
+          if (!path) return "-";
+          return path.split(/[\\/]/).pop();
+        }
+        
+        function fillSettings(settings) {
+          const form = $("#settings-form");
+          for (const [key, value] of Object.entries(settings)) {
+            const input = form.elements[key];
+            if (!input) continue;
+            if (input.type === "checkbox") {
+              input.checked = Boolean(value);
+            } else {
+              input.value = value ?? "";
+            }
+          }
+          state.settingsLoaded = true;
+        }
+        
+        function collectSettings() {
+          const form = $("#settings-form");
+          const patch = {};
+          for (const input of form.elements) {
+            if (!input.name) continue;
+            if (input.type === "checkbox") {
+              patch[input.name] = input.checked;
+            } else if (input.type === "number") {
+              patch[input.name] = Number(input.value);
+            } else {
+              patch[input.name] = input.value;
+            }
+          }
+          return patch;
+        }
+        
+        function renderJobs(jobs) {
+          const body = $("#jobs");
+          body.innerHTML = jobs
+            .map((job) => {
+              const statusClass = `status-${job.status}`;
+              const progress = Number(job.progress_percent || 0).toFixed(1);
+              return `
+                <tr>
+                  <td>${job.id}</td>
+                  <td title="${job.source_path || ""}">${fileName(job.source_path)}</td>
+                  <td class="${statusClass}">${job.status}</td>
+                  <td>${job.source_codec || "-"}</td>
+                  <td>${formatBytes(job.source_size_bytes)} -> ${formatBytes(job.output_size_bytes)}</td>
+                  <td>${progress}%</td>
+                  <td>${job.fps ?? "-"}</td>
+                  <td>${job.speed || "-"}</td>
+                  <td>${job.error_message || ""}</td>
+                  <td>
+                    <button data-job-action="retry" data-id="${job.id}">Retry</button>
+                    <button data-job-action="skip" data-id="${job.id}">Skip</button>
+                    <button data-job-action="move-to-failed" data-id="${job.id}">Quarantine</button>
+                  </td>
+                </tr>
+              `;
+            })
+            .join("");
+        }
+        
+        function renderProgress(data) {
+          const worker = data.worker;
+          const stats = data.stats;
+          const current = data.current;
+          const running = worker.thread_alive && worker.worker_enabled;
+          const paused = !worker.auto_convert_enabled;
+          $("#service-status").textContent = running ? (paused ? "Paused" : "Running") : "Stopped";
+          $("#current-file").textContent = current ? fileName(current.source_path) : "-";
+          $("#current-progress").textContent = current ? `${Number(current.progress_percent || 0).toFixed(1)}%` : "0%";
+          $("#queue-count").textContent = `${stats.processed_jobs} / ${stats.total_jobs}`;
+          $("#saved").textContent = `${formatBytes(stats.saved_bytes)} (${stats.saved_percent}%)`;
+          $("#errors").textContent = stats.failed_jobs;
+          if (!state.settingsLoaded) fillSettings(data.settings);
+        }
+        
+        async function refresh() {
+          try {
+            const [progress, jobs, logs] = await Promise.all([
+              api("/api/progress"),
+              api("/api/jobs?limit=100"),
+              api("/api/logs?lines=120"),
+            ]);
+            renderProgress(progress);
+            renderJobs(jobs);
+            $("#logs").textContent = logs;
+          } catch (error) {
+            $("#service-status").textContent = "Error";
+            console.error(error);
+          }
+        }
+        
+        document.querySelectorAll("[data-action]").forEach((button) => {
+          button.addEventListener("click", async () => {
+            await api(`/api/worker/${button.dataset.action}`, { method: "POST" });
+            await refresh();
+          });
+        });
+        
+        $("#scan-now").addEventListener("click", async () => {
+          await api("/api/scan", { method: "POST" });
+          await refresh();
+        });
+        
+        $("#settings-form").addEventListener("submit", async (event) => {
+          event.preventDefault();
+          await api("/api/settings", {
+            method: "PUT",
+            body: JSON.stringify(collectSettings()),
+          });
+          state.settingsLoaded = false;
+          await refresh();
+        });
+        
+        $("#jobs").addEventListener("click", async (event) => {
+          const button = event.target.closest("button[data-job-action]");
+          if (!button) return;
+          await api(`/api/jobs/${button.dataset.id}/${button.dataset.jobAction}`, { method: "POST" });
+          await refresh();
+        });
+        
+        refresh();
+        setInterval(refresh, 1500);
+        JS_APP
+        cat > /app/app/static/styles.css <<'CSS_STYLES'
+        :root {
+          color-scheme: light;
+          font-family: Arial, Helvetica, sans-serif;
+          background: #f5f6f8;
+          color: #1b1f24;
+        }
+        
+        body {
+          margin: 0;
+        }
+        
+        header {
+          display: flex;
+          justify-content: space-between;
+          gap: 16px;
+          align-items: center;
+          padding: 16px 20px;
+          background: #ffffff;
+          border-bottom: 1px solid #d8dde5;
+        }
+        
+        h1,
+        h2 {
+          margin: 0;
+        }
+        
+        h1 {
+          font-size: 22px;
+        }
+        
+        h2 {
+          font-size: 18px;
+          margin-bottom: 12px;
+        }
+        
+        main {
+          padding: 20px;
+          display: grid;
+          gap: 20px;
+        }
+        
+        button {
+          border: 1px solid #b9c0ca;
+          background: #ffffff;
+          border-radius: 6px;
+          padding: 8px 12px;
+          cursor: pointer;
+        }
+        
+        button:hover {
+          background: #eef3ff;
+        }
+        
+        .actions {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+          gap: 12px;
+        }
+        
+        .card,
+        section {
+          background: #ffffff;
+          border: 1px solid #d8dde5;
+          border-radius: 8px;
+        }
+        
+        .card {
+          padding: 14px;
+          display: grid;
+          gap: 8px;
+        }
+        
+        .card span {
+          color: #5a6573;
+          font-size: 13px;
+        }
+        
+        .card strong {
+          font-size: 18px;
+          overflow-wrap: anywhere;
+        }
+        
+        section {
+          padding: 16px;
+        }
+        
+        .settings {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+          gap: 12px;
+        }
+        
+        label {
+          display: grid;
+          gap: 4px;
+          color: #4a5563;
+          font-size: 13px;
+        }
+        
+        input {
+          border: 1px solid #b9c0ca;
+          border-radius: 6px;
+          padding: 8px;
+          font: inherit;
+        }
+        
+        .check {
+          grid-template-columns: auto 1fr;
+          align-items: center;
+        }
+        
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+        }
+        
+        th,
+        td {
+          border-bottom: 1px solid #e2e6ed;
+          padding: 8px;
+          text-align: left;
+          vertical-align: top;
+        }
+        
+        td {
+          overflow-wrap: anywhere;
+        }
+        
+        .status-success {
+          color: #167a3b;
+        }
+        
+        .status-converting {
+          color: #1f62c7;
+        }
+        
+        .status-failed,
+        .status-moved_to_failed {
+          color: #b42318;
+        }
+        
+        .status-pending,
+        .status-waiting_file_copy,
+        .status-skipped {
+          color: #946200;
+        }
+        
+        pre {
+          max-height: 280px;
+          overflow: auto;
+          background: #101418;
+          color: #dce7f3;
+          padding: 12px;
+          border-radius: 6px;
+          white-space: pre-wrap;
+        }
+        
+        @media (max-width: 700px) {
+          header {
+            align-items: flex-start;
+            flex-direction: column;
+          }
+        }
+        CSS_STYLES
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          apt-get update
+          apt-get install -y --no-install-recommends ffmpeg ca-certificates
+          rm -rf /var/lib/apt/lists/*
+        fi
         pip install --no-cache-dir -r /app/requirements.txt
+        cd /app
         exec uvicorn app.main:app --host 0.0.0.0 --port 8080
