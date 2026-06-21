@@ -1,0 +1,23 @@
+manifestVersion: 1
+id: ilya-auto-h265-video-converter
+name: Auto H265 Converter
+tagline: Automatic FFmpeg video converter with live progress
+icon: https://raw.githubusercontent.com/ilyasweg-ai/ilya-umbrel-app-store/main/ilya-auto-h265-video-converter/icon.svg
+category: files
+version: "0.1.0"
+port: 8080
+description: >-
+  Web UI for automatic video conversion on Umbrel. Watches an input folder, converts selected videos to H.265/HEVC with FFmpeg, shows live progress, queue, savings statistics, and quarantines failed files instead of retrying forever.
+developer: Ilya
+website: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
+submitter: Ilya
+submission: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
+repo: https://github.com/ilyasweg-ai/ilya-umbrel-app-store
+support: https://github.com/ilyasweg-ai/ilya-umbrel-app-store/issues
+gallery: []
+releaseNotes: >-
+  Initial MVP: dashboard, settings, queue, FFmpeg H.264 to H.265 conversion, safe retry, failed quarantine, and live progress.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
