@@ -13,7 +13,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "app.sqlite")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -39,6 +39,21 @@ shutdown_event = threading.Event()
 worker_started_at = time.time()
 last_scan_at = 0
 last_worker_error = ""
+
+preview_lock = threading.RLock()
+preview_status = {
+    "running": False,
+    "state": "idle",
+    "started_at": 0,
+    "finished_at": 0,
+    "scanned": 0,
+    "matched": 0,
+    "skipped": 0,
+    "current_path": "",
+    "message": "Ожидание",
+    "result": None,
+    "error": ""
+}
 
 DEFAULT_SETTINGS = {
     # По умолчанию ничего не запускаем и не выбираем, чтобы приложение не трогало случайные папки.
@@ -574,7 +589,76 @@ def stat_list(dct):
     return arr
 
 
-def preview_payload(settings):
+
+def set_preview_status(**kwargs):
+    with preview_lock:
+        preview_status.update(kwargs)
+        return dict(preview_status)
+
+
+def get_preview_status():
+    with preview_lock:
+        data = dict(preview_status)
+        if data.get("started_at") and data.get("running"):
+            data["elapsed_seconds"] = round(time.time() - float(data.get("started_at") or 0), 1)
+        elif data.get("started_at") and data.get("finished_at"):
+            data["elapsed_seconds"] = round(float(data.get("finished_at") or 0) - float(data.get("started_at") or 0), 1)
+        else:
+            data["elapsed_seconds"] = 0
+        return data
+
+
+def start_preview_analysis(settings):
+    with preview_lock:
+        if preview_status.get("running"):
+            return {"ok": True, "already_running": True, "status": dict(preview_status)}
+        preview_status.update({
+            "running": True,
+            "state": "starting",
+            "started_at": time.time(),
+            "finished_at": 0,
+            "scanned": 0,
+            "matched": 0,
+            "skipped": 0,
+            "current_path": "",
+            "message": "Запускаю анализ...",
+            "result": None,
+            "error": ""
+        })
+
+    def runner():
+        try:
+            result = preview_payload(settings, use_progress=True)
+            with preview_lock:
+                preview_status.update({
+                    "running": False,
+                    "state": "done" if result.get("ok") else "error",
+                    "finished_at": time.time(),
+                    "message": "Сканирование завершено" if result.get("ok") else result.get("error", "Ошибка сканирования"),
+                    "result": result,
+                    "error": "" if result.get("ok") else result.get("error", "Ошибка сканирования"),
+                    "scanned": result.get("scanned", preview_status.get("scanned", 0)),
+                    "matched": result.get("matched", preview_status.get("matched", 0)),
+                    "skipped": result.get("skipped", preview_status.get("skipped", 0)),
+                    "current_path": ""
+                })
+        except Exception as e:
+            log_app(f"preview_thread_error {repr(e)}")
+            with preview_lock:
+                preview_status.update({
+                    "running": False,
+                    "state": "error",
+                    "finished_at": time.time(),
+                    "message": "Ошибка сканирования: " + str(e),
+                    "error": str(e),
+                    "current_path": ""
+                })
+
+    threading.Thread(target=runner, daemon=True).start()
+    return {"ok": True, "already_running": False, "status": get_preview_status()}
+
+
+def preview_payload(settings, use_progress=False):
     settings = dict(load_settings(), **(settings or {}))
     normalize_settings_inplace(settings)
     scanned = 0
@@ -589,16 +673,32 @@ def preview_payload(settings):
     res_stats = {}
     matched_ext_stats = {}
     matched_codec_stats = {}
-    input_path = to_container_path(settings.get("input_path", ""))
+    raw_input_path = str(settings.get("input_path", "") or "")
+    input_path = to_container_path(raw_input_path)
+    empty_result = {"ok": False, "error": "", "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "all_source_h": fmt_bytes(0), "all_source_bytes": 0, "samples": [], "warnings": [], "ext_stats": [], "codec_stats": [], "resolution_stats": [], "matched_ext_stats": [], "matched_codec_stats": [], "input_path": raw_input_path, "container_input_path": input_path}
     if not input_path:
-        return {"ok": False, "error": "Не выбран входящий файл или папка", "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "all_source_h": fmt_bytes(0), "samples": [], "warnings": [], "ext_stats": [], "codec_stats": [], "resolution_stats": [], "matched_ext_stats": []}
+        empty_result["error"] = "Не выбран входящий файл или папка"
+        if use_progress:
+            set_preview_status(running=False, state="error", message=empty_result["error"], error=empty_result["error"], result=empty_result, finished_at=time.time())
+        return empty_result
     if not os.path.exists(input_path):
-        return {"ok": False, "error": "Входящий путь не существует: " + input_path, "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "all_source_h": fmt_bytes(0), "samples": [], "warnings": [], "ext_stats": [], "codec_stats": [], "resolution_stats": [], "matched_ext_stats": []}
+        empty_result["error"] = "Входящий путь не существует внутри контейнера: " + input_path
+        empty_result["warnings"].append("Выбранный путь: " + raw_input_path)
+        empty_result["warnings"].append("Путь внутри контейнера: " + input_path)
+        if use_progress:
+            set_preview_status(running=False, state="error", message=empty_result["error"], error=empty_result["error"], result=empty_result, finished_at=time.time())
+        return empty_result
+    if use_progress:
+        set_preview_status(running=True, state="scanning", scanned=0, matched=0, skipped=0, current_path=input_path, message="Сканирую: " + input_path)
     limit = int(settings.get("preview_probe_limit", 3000) or 3000)
+    last_progress_update = time.time()
     allowed = split_csv(settings.get("allowed_extensions")) or [e.lstrip('.') for e in VIDEO_EXTS]
     allowed = set(x.lower().lstrip('.') for x in allowed)
     for p in iter_all_video_candidates(settings):
         scanned += 1
+        if use_progress and (scanned == 1 or scanned % 10 == 0 or time.time() - last_progress_update > 0.7):
+            set_preview_status(running=True, state="scanning", scanned=scanned, matched=matched, skipped=skipped, current_path=p, message=f"Сканирую файл {scanned}: {os.path.basename(p)}")
+            last_progress_update = time.time()
         if scanned > limit:
             warnings.append(f"Предпросмотр остановлен на лимите {limit} файлов")
             break
@@ -625,7 +725,10 @@ def preview_payload(settings):
                 samples.append({"path": p, "ext": ext, "codec": info.get("codec"), "width": info.get("width"), "height": info.get("height"), "duration": round(float(info.get("duration") or 0), 1), "size_h": fmt_bytes(info.get("size") or fsize)})
         else:
             skipped += 1
-    return {"ok": True, "scanned": scanned, "matched": matched, "skipped": skipped, "source_bytes": total_bytes, "source_h": fmt_bytes(total_bytes), "all_source_bytes": all_bytes, "all_source_h": fmt_bytes(all_bytes), "samples": samples, "warnings": warnings, "ext_stats": stat_list(ext_stats), "codec_stats": stat_list(codec_stats), "resolution_stats": stat_list(res_stats), "matched_ext_stats": stat_list(matched_ext_stats), "matched_codec_stats": stat_list(matched_codec_stats)}
+    result = {"ok": True, "scanned": scanned, "matched": matched, "skipped": skipped, "source_bytes": total_bytes, "source_h": fmt_bytes(total_bytes), "all_source_bytes": all_bytes, "all_source_h": fmt_bytes(all_bytes), "samples": samples, "warnings": warnings, "ext_stats": stat_list(ext_stats), "codec_stats": stat_list(codec_stats), "resolution_stats": stat_list(res_stats), "matched_ext_stats": stat_list(matched_ext_stats), "matched_codec_stats": stat_list(matched_codec_stats), "input_path": raw_input_path, "container_input_path": input_path, "is_file": os.path.isfile(input_path), "is_dir": os.path.isdir(input_path)}
+    if use_progress:
+        set_preview_status(running=False, state="done", scanned=scanned, matched=matched, skipped=skipped, current_path="", message="Сканирование завершено", result=result, finished_at=time.time())
+    return result
 
 
 def list_path(path):
@@ -1152,7 +1255,8 @@ function selectAllExt(on){document.querySelectorAll('.extBox').forEach(x=>x.chec
 function applyExtSelection(){let arr=[...document.querySelectorAll('.extBox:checked')].map(x=>x.value);setVal('allowed_extensions',arr.join(','))}
 function drawPie(stats){let total=stats.reduce((a,x)=>a+x.count,0);let acc=0;let parts=[];stats.forEach((x,i)=>{let a=acc/total*100;acc+=x.count;let b=acc/total*100;parts.push(colors[i%colors.length]+' '+a+'% '+b+'%')});document.getElementById('pie').style.background=total?'conic-gradient('+parts.join(',')+')':'#102126'}
 function renderExtChecks(stats){let allowed=(document.getElementById('set_allowed_extensions')?.value||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);let all=!allowed.length;document.getElementById('extChecks').innerHTML=stats.map((x,i)=>'<label class="check"><input class="extBox" type="checkbox" value="'+esc(x.name)+'" '+(all||allowed.includes(x.name)?'checked':'')+' onchange="applyExtSelection()"><span class="sw" style="background:'+colors[i%colors.length]+'"></span><span>.'+esc(x.name)+' · '+x.count+' шт · '+esc(x.bytes_h)+'</span></label>').join('')}
-async function previewFilters(){let obj=collectSettings();let d=await postJson('/api/preview',obj);previewData=d;if(!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+d.error;return}drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);let text='Всего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\nПодходит под текущие фильтры: '+d.matched+'\nОбъём подходящих: '+d.source_h+'\nНе подходит: '+d.skipped+'\n';if(d.codec_stats?.length)text+='\nКодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.samples?.length)text+='\nПримеры подходящих файлов:\n'+d.samples.slice(0,10).map(x=>'- '+x.size_h+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path).join('\n');document.getElementById('previewSummary').textContent=text}
+function renderPreviewResult(d){previewData=d;if(!d||!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+((d&&d.error)||'неизвестная ошибка')+'\n\nВыбранный путь: '+((d&&d.input_path)||'')+'\nПуть внутри контейнера: '+((d&&d.container_input_path)||'')+'\n\n'+(((d&&d.warnings)||[]).join('\n'));return}drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);let text='Сканирование завершено.\n\nВыбранный путь: '+(d.input_path||'')+'\nПуть внутри контейнера: '+(d.container_input_path||'')+'\n\nВсего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\nПодходит под текущие фильтры: '+d.matched+'\nОбъём подходящих: '+d.source_h+'\nНе подходит: '+d.skipped+'\n';if(d.warnings?.length)text+='\nПредупреждения:\n'+d.warnings.map(x=>'- '+x).join('\n')+'\n';if(d.ext_stats?.length)text+='\nФорматы:\n'+d.ext_stats.map(x=>'- .'+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.codec_stats?.length)text+='\nКодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.samples?.length)text+='\nПримеры подходящих файлов:\n'+d.samples.slice(0,10).map(x=>'- '+x.size_h+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path).join('\n');document.getElementById('previewSummary').textContent=text}
+async function previewFilters(){let obj=collectSettings();document.getElementById('previewSummary').textContent='Запускаю сканирование...';let start=await postJson('/api/preview/start',obj);if(!start.ok){document.getElementById('previewSummary').textContent='Не удалось запустить сканирование: '+(start.error||'unknown');return}for(let i=0;i<100000;i++){let stt=await getJson('/api/preview/status');let elapsed=stt.elapsed_seconds||0;let text='Статус: '+(stt.state||'')+'\n'+(stt.message||'')+'\n\nПросканировано: '+(stt.scanned||0)+' файлов\nПодходит: '+(stt.matched||0)+'\nНе подходит: '+(stt.skipped||0)+'\nВремя: '+elapsed+' сек.\n\nТекущий файл:\n'+(stt.current_path||'');document.getElementById('previewSummary').textContent=text;if(!stt.running){if(stt.result){renderPreviewResult(stt.result)}else if(stt.error){document.getElementById('previewSummary').textContent='Ошибка сканирования: '+stt.error}break}await new Promise(r=>setTimeout(r,700))}}
 async function loadJobs(){let stv=document.getElementById('jobStatus').value;let data=await getJson('/api/jobs?limit=500'+(stv?'&status='+encodeURIComponent(stv):''));document.getElementById('jobsBody').innerHTML=data.jobs.map(j=>'<tr><td><span class="pill">'+esc(st(j.status))+'</span></td><td>'+esc(j.progress_percent||0)+'%</td><td class="path mono">'+fmtPath(j.source_path)+'</td><td class="path mono">'+fmtPath(j.output_path)+'</td><td>'+esc(j.source_size_h)+' → '+esc(j.output_size_h)+'</td><td class="path">'+esc(j.error_message||'')+'</td><td><button class="btn" onclick="retryJob(\''+j.id+'\')">повторить</button> <button class="btn yellow" onclick="moveFailed(\''+j.id+'\')">в failed</button></td></tr>').join('')}
 async function retryJob(id){await postJson('/api/jobs/'+id+'/retry',{});loadJobs()} async function moveFailed(id){await postJson('/api/jobs/'+id+'/move-to-failed',{});loadJobs()} async function loadLogs(kind){let d=await getJson('/api/logs?kind='+kind+'&lines=300');document.getElementById('logBox').textContent=d.text||''}
 function openBrowser(target,mode){browserTarget=target;browserMode=mode;document.getElementById('browserModal').classList.add('show');browseTo(document.getElementById('set_'+target)?.value||'')}function closeBrowser(){document.getElementById('browserModal').classList.remove('show')}
@@ -1204,6 +1308,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stats":
             self.send_json(stats_payload())
             return
+        if path == "/api/preview/status":
+            self.send_json(get_preview_status())
+            return
         if path == "/api/fs":
             self.send_json(list_path(qs.get("path", [""])[0]))
             return
@@ -1243,6 +1350,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/jobs/clear":
             clear_jobs_and_logs()
             self.send_json({"ok": True})
+            return
+        if path == "/api/preview/start":
+            self.send_json(start_preview_analysis(body))
             return
         if path == "/api/preview":
             self.send_json(preview_payload(body))
