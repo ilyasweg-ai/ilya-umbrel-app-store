@@ -13,7 +13,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "app.sqlite")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -667,6 +667,7 @@ def preview_payload(settings, use_progress=False):
     total_bytes = 0
     all_bytes = 0
     samples = []
+    all_files = []
     warnings = []
     ext_stats = {}
     codec_stats = {}
@@ -675,7 +676,28 @@ def preview_payload(settings, use_progress=False):
     matched_codec_stats = {}
     raw_input_path = str(settings.get("input_path", "") or "")
     input_path = to_container_path(raw_input_path)
-    empty_result = {"ok": False, "error": "", "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "all_source_h": fmt_bytes(0), "all_source_bytes": 0, "samples": [], "warnings": [], "ext_stats": [], "codec_stats": [], "resolution_stats": [], "matched_ext_stats": [], "matched_codec_stats": [], "input_path": raw_input_path, "container_input_path": input_path}
+    empty_result = {
+        "ok": False,
+        "error": "",
+        "scanned": 0,
+        "matched": 0,
+        "skipped": 0,
+        "source_bytes": 0,
+        "source_h": fmt_bytes(0),
+        "all_source_h": fmt_bytes(0),
+        "all_source_bytes": 0,
+        "samples": [],
+        "all_files": [],
+        "all_files_count": 0,
+        "warnings": [],
+        "ext_stats": [],
+        "codec_stats": [],
+        "resolution_stats": [],
+        "matched_ext_stats": [],
+        "matched_codec_stats": [],
+        "input_path": raw_input_path,
+        "container_input_path": input_path,
+    }
     if not input_path:
         empty_result["error"] = "Не выбран входящий файл или папка"
         if use_progress:
@@ -690,18 +712,21 @@ def preview_payload(settings, use_progress=False):
         return empty_result
     if use_progress:
         set_preview_status(running=True, state="scanning", scanned=0, matched=0, skipped=0, current_path=input_path, message="Сканирую: " + input_path)
+
     limit = int(settings.get("preview_probe_limit", 3000) or 3000)
     last_progress_update = time.time()
     allowed = split_csv(settings.get("allowed_extensions")) or [e.lstrip('.') for e in VIDEO_EXTS]
     allowed = set(x.lower().lstrip('.') for x in allowed)
+
     for p in iter_all_video_candidates(settings):
+        if scanned >= limit:
+            warnings.append(f"Предпросмотр остановлен на лимите {limit} файлов")
+            break
         scanned += 1
         if use_progress and (scanned == 1 or scanned % 10 == 0 or time.time() - last_progress_update > 0.7):
             set_preview_status(running=True, state="scanning", scanned=scanned, matched=matched, skipped=skipped, current_path=p, message=f"Сканирую файл {scanned}: {os.path.basename(p)}")
             last_progress_update = time.time()
-        if scanned > limit:
-            warnings.append(f"Предпросмотр остановлен на лимите {limit} файлов")
-            break
+
         ext = os.path.splitext(p)[1].lower().lstrip('.') or "unknown"
         try:
             fsize = os.path.getsize(p)
@@ -709,27 +734,90 @@ def preview_payload(settings, use_progress=False):
             fsize = 0
         all_bytes += fsize
         add_stat_bucket(ext_stats, ext, fsize)
-        if ext not in allowed:
-            skipped += 1
-            continue
+
         info, err = get_video_info(p)
+        file_rec = {
+            "path": p,
+            "ext": ext,
+            "size": int(fsize or 0),
+            "size_h": fmt_bytes(fsize),
+            "codec": "unknown",
+            "width": 0,
+            "height": 0,
+            "duration": 0,
+            "probe_ok": False,
+            "error": err or "",
+        }
+
         if info:
-            add_stat_bucket(codec_stats, info.get("codec"), info.get("size") or fsize)
-            add_stat_bucket(res_stats, resolution_bucket(info.get("width"), info.get("height")), info.get("size") or fsize)
-        if info and passes_probe_filters(info, settings):
+            codec = str(info.get("codec") or "unknown")
+            width = int(info.get("width") or 0)
+            height = int(info.get("height") or 0)
+            duration = float(info.get("duration") or 0)
+            size = int(info.get("size") or fsize or 0)
+            add_stat_bucket(codec_stats, codec, size)
+            add_stat_bucket(res_stats, resolution_bucket(width, height), size)
+            file_rec.update({
+                "codec": codec,
+                "width": width,
+                "height": height,
+                "duration": round(duration, 1),
+                "size": size,
+                "size_h": fmt_bytes(size),
+                "probe_ok": True,
+                "error": "",
+            })
+
+        # Храним данные по всем найденным видео. Это нужно для динамического пересчёта
+        # прямо в браузере без повторного сканирования папки при изменении фильтров.
+        all_files.append(file_rec)
+
+        is_match = bool(info) and ext in allowed and passes_probe_filters(info, settings)
+        if is_match:
             matched += 1
-            total_bytes += int(info.get("size") or fsize)
-            add_stat_bucket(matched_ext_stats, ext, info.get("size") or fsize)
-            add_stat_bucket(matched_codec_stats, info.get("codec"), info.get("size") or fsize)
+            size = int(file_rec.get("size") or 0)
+            total_bytes += size
+            add_stat_bucket(matched_ext_stats, ext, size)
+            add_stat_bucket(matched_codec_stats, file_rec.get("codec"), size)
             if len(samples) < 30:
-                samples.append({"path": p, "ext": ext, "codec": info.get("codec"), "width": info.get("width"), "height": info.get("height"), "duration": round(float(info.get("duration") or 0), 1), "size_h": fmt_bytes(info.get("size") or fsize)})
+                samples.append({
+                    "path": p,
+                    "ext": ext,
+                    "codec": file_rec.get("codec"),
+                    "width": file_rec.get("width"),
+                    "height": file_rec.get("height"),
+                    "duration": file_rec.get("duration"),
+                    "size_h": file_rec.get("size_h"),
+                })
         else:
             skipped += 1
-    result = {"ok": True, "scanned": scanned, "matched": matched, "skipped": skipped, "source_bytes": total_bytes, "source_h": fmt_bytes(total_bytes), "all_source_bytes": all_bytes, "all_source_h": fmt_bytes(all_bytes), "samples": samples, "warnings": warnings, "ext_stats": stat_list(ext_stats), "codec_stats": stat_list(codec_stats), "resolution_stats": stat_list(res_stats), "matched_ext_stats": stat_list(matched_ext_stats), "matched_codec_stats": stat_list(matched_codec_stats), "input_path": raw_input_path, "container_input_path": input_path, "is_file": os.path.isfile(input_path), "is_dir": os.path.isdir(input_path)}
+
+    result = {
+        "ok": True,
+        "scanned": scanned,
+        "matched": matched,
+        "skipped": skipped,
+        "source_bytes": total_bytes,
+        "source_h": fmt_bytes(total_bytes),
+        "all_source_bytes": all_bytes,
+        "all_source_h": fmt_bytes(all_bytes),
+        "samples": samples,
+        "all_files": all_files,
+        "all_files_count": len(all_files),
+        "warnings": warnings,
+        "ext_stats": stat_list(ext_stats),
+        "codec_stats": stat_list(codec_stats),
+        "resolution_stats": stat_list(res_stats),
+        "matched_ext_stats": stat_list(matched_ext_stats),
+        "matched_codec_stats": stat_list(matched_codec_stats),
+        "input_path": raw_input_path,
+        "container_input_path": input_path,
+        "is_file": os.path.isfile(input_path),
+        "is_dir": os.path.isdir(input_path),
+    }
     if use_progress:
         set_preview_status(running=False, state="done", scanned=scanned, matched=matched, skipped=skipped, current_path="", message="Сканирование завершено", result=result, finished_at=time.time())
     return result
-
 
 def list_path(path):
     if not path:
@@ -1212,7 +1300,7 @@ INDEX_HTML = r"""
 <section id="settings" class="hidden">
   <div class="card"><h2>Быстрые пресеты</h2><div class="hint">Пресет просто заполняет настройки. Потом можно руками поменять любой параметр.</div><div class="row" style="margin-top:12px" id="presetButtons"></div></div>
   <div class="card section"><h2>1. Что обрабатывать и куда складывать</h2><div class="formgrid" id="pathForm"></div></div>
-  <div class="card section"><h2>2. Предпросмотр найденных видео</h2><div class="row"><button class="btn blue" onclick="previewFilters()">Проанализировать папку / файл</button><button class="btn" onclick="selectAllExt(true)">Выбрать все форматы</button><button class="btn" onclick="selectAllExt(false)">Снять все</button></div><div class="grid2" style="margin-top:14px"><div><div id="pie" class="pie"></div></div><div><h3>Форматы, найденные при сканировании</h3><div id="extChecks" class="checkgrid"></div><div id="previewSummary" class="log mono" style="margin-top:12px;max-height:220px">Нажми “Проанализировать”.</div></div></div></div>
+  <div class="card section"><h2>2. Предпросмотр найденных видео</h2><div class="hint">Сначала сканируем выбранную папку/файл. Потом число “Будет обработано” пересчитывается прямо на странице при изменении форматов, кодеков, разрешений, длительности и размера. Повторно сканировать нужно только если в папке появились новые файлы.</div><div class="row" style="margin-top:12px"><button class="btn blue" onclick="previewFilters()">Проанализировать папку / файл</button><button class="btn" onclick="selectAllExt(true)">Выбрать все форматы</button><button class="btn" onclick="selectAllExt(false)">Снять все</button></div><div id="dynamicPreview" class="grid3" style="margin-top:14px"></div><div class="grid2" style="margin-top:14px"><div><div id="pie" class="pie"></div></div><div><h3>Форматы, найденные при сканировании</h3><div id="extChecks" class="checkgrid"></div><div id="previewSummary" class="log mono" style="margin-top:12px;max-height:220px">Нажми “Проанализировать”.</div></div></div></div>
   <div class="card section"><h2>3. Простые настройки конвертации</h2><div class="formgrid" id="simpleForm"></div><div class="row" style="margin-top:12px"><button class="btn" onclick="setResolutionPreset('720p')">Выход до 720p</button><button class="btn" onclick="setResolutionPreset('1080p')">до 1080p</button><button class="btn" onclick="setResolutionPreset('2k')">до 2K</button><button class="btn" onclick="setResolutionPreset('4k')">до 4K</button><button class="btn" onclick="setResolutionPreset('4096x2048')">до 4096×2048</button></div></div>
   <div class="card section"><details class="details"><summary>Расширенные настройки FFmpeg и поведения при ошибках</summary><div class="formgrid" id="advancedForm" style="margin-top:14px"></div></details></div>
   <div class="card section"><h2>Сохранение и обслуживание</h2><div class="row"><button class="btn green" onclick="saveSettings()">Сохранить настройки</button><button class="btn" onclick="loadSettings()">Перезагрузить форму</button><button class="btn yellow" onclick="clearPaths()">Очистить пути</button><button class="btn yellow" onclick="resetSettings()">Сбросить настройки</button><button class="btn red" onclick="clearStats()">Очистить статистику/очередь</button></div><div class="small" style="margin-top:10px">Очистка статистики удаляет историю сканирования и очередь из базы приложения. Готовые видео и исходники не удаляются.</div></div>
@@ -1237,14 +1325,15 @@ advanced:[['filter_min_width','Фильтр: мин. ширина','number',''],
 };
 const selectOptions={hevc_action:[['skip','пропускать'],['move','переносить'],['copy','копировать'],['hardlink','hardlink']],container:[['mp4','mp4'],['mkv','mkv']],preset:['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'].map(x=>[x,x]),audio_mode:[['aac','AAC 160k'],['copy','копировать'],['none','без звука']]};
 function fieldList(){return [...fields.path,...fields.simple,...fields.advanced]}
+function settingsChanged(){updateDynamicPreview()}
 function label(k,txt){return '<label>'+esc(txt)+' <span class="q" data-tip="'+esc(tips[k]||'Подсказка')+'">?</span></label>'}
-function inputHtml(k,txt,type,cls){let v=settingsCache[k]??'';let html='<div class="'+(cls||'')+'">'+label(k,txt); if(type==='select'){html+='<select id="set_'+k+'">'+(selectOptions[k]||[['true','true'],['false','false']]).map(o=>'<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>').join('')+'</select>'}else if(type==='checkbox'){html+='<select id="set_'+k+'" onchange="syncDisabled()"><option value="true">включено</option><option value="false">выключено</option></select>'}else if(type==='path-dir'||type==='path-file'){html+='<div class="row" style="flex-wrap:nowrap"><input class="mono" id="set_'+k+'" value="'+esc(v)+'"><button class="btn" type="button" onclick="openBrowser(\''+k+'\',\''+(type==='path-file'?'file':'dir')+'\')">выбрать</button></div>'}else{html+='<input id="set_'+k+'" type="'+(type==='number'?'number':'text')+'" value="'+esc(v)+'">'} return html+'</div>'}
+function inputHtml(k,txt,type,cls){let v=settingsCache[k]??'';let html='<div class="'+(cls||'')+'">'+label(k,txt); let ev=' onchange="settingsChanged()" oninput="settingsChanged()"'; if(type==='select'){html+='<select id="set_'+k+'"'+ev+'>'+(selectOptions[k]||[['true','true'],['false','false']]).map(o=>'<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>').join('')+'</select>'}else if(type==='checkbox'){html+='<select id="set_'+k+'" onchange="syncDisabled();settingsChanged()"><option value="true">включено</option><option value="false">выключено</option></select>'}else if(type==='path-dir'||type==='path-file'){html+='<div class="row" style="flex-wrap:nowrap"><input class="mono" id="set_'+k+'" value="'+esc(v)+'"'+ev+'><button class="btn" type="button" onclick="openBrowser(\''+k+'\',\''+(type==='path-file'?'file':'dir')+'\')">выбрать</button></div>'}else{html+='<input id="set_'+k+'" type="'+(type==='number'?'number':'text')+'" value="'+esc(v)+'"'+ev+'>'} return html+'</div>'}
 function renderSettings(){document.getElementById('pathForm').innerHTML=fields.path.map(f=>inputHtml(...f)).join('');document.getElementById('simpleForm').innerHTML=fields.simple.map(f=>inputHtml(...f)).join('');document.getElementById('advancedForm').innerHTML=fields.advanced.map(f=>inputHtml(...f)).join('');fieldList().forEach(f=>{let el=document.getElementById('set_'+f[0]); if(el)el.value=String(settingsCache[f[0]]??'')});renderPresets();syncDisabled()}
 async function loadSettings(){settingsCache=await getJson('/api/settings');renderSettings()}
 function collectSettings(){let obj={};fieldList().forEach(f=>{let el=document.getElementById('set_'+f[0]); if(!el)return;let val=el.value;if(f[2]==='number')val=Number(val);if(f[2]==='checkbox')val=(val==='true');obj[f[0]]=val});return obj}
 function syncDisabled(){let temp=document.getElementById('set_use_temp_path')?.value==='true';let fail=document.getElementById('set_use_failed_path')?.value==='true';let tp=document.getElementById('set_temp_path');if(tp)tp.disabled=!temp;let fp=document.getElementById('set_failed_path');if(fp)fp.disabled=!fail}
 function renderPresets(){const p=[['balanced','Баланс','H.265 CRF 24, medium, до 4096×2048'],['quality','Качество','CRF 22, slow, больше размер'],['small','Сжать сильнее','CRF 26, medium, меньше размер'],['compat','Совместимый MP4','MP4 + AAC + safe remux'],['nohevc','Не трогать H.265','готовые HEVC пропускать']];document.getElementById('presetButtons').innerHTML=p.map(x=>'<button class="btn preset" onclick="applyPreset(\''+x[0]+'\')"><b>'+x[1]+'</b><span>'+x[2]+'</span></button>').join('')}
-function setVal(k,v){let el=document.getElementById('set_'+k); if(el)el.value=String(v)}
+function setVal(k,v){let el=document.getElementById('set_'+k); if(el)el.value=String(v);updateDynamicPreview()}
 function applyPreset(id){if(id==='balanced'){setVal('video_encoder','libx265');setVal('crf',24);setVal('preset','medium');setVal('container','mp4');setVal('audio_mode','aac');setVal('audio_bitrate','160k');setVal('max_width',4096);setVal('max_height',2048);setVal('scale_if_too_large',true);setVal('auto_safe_retry',true);setVal('safe_remux_to_mp4',true);setVal('allow_mkv_fallback',false)} if(id==='quality'){setVal('crf',22);setVal('preset','slow');setVal('audio_bitrate','192k')} if(id==='small'){setVal('crf',26);setVal('preset','medium');setVal('audio_bitrate','128k')} if(id==='compat'){setVal('container','mp4');setVal('audio_mode','aac');setVal('safe_remux_to_mp4',true);setVal('allow_mkv_fallback',false)} if(id==='nohevc'){setVal('hevc_action','skip')} }
 function setResolutionPreset(id){let map={"720p":[1280,720],"1080p":[1920,1080],"2k":[2560,1440],"4k":[3840,2160],"4096x2048":[4096,2048]};let m=map[id];if(m){setVal('max_width',m[0]);setVal('max_height',m[1]);setVal('scale_if_too_large',true)}}
 async function saveSettings(){let obj=collectSettings();await postJson('/api/settings',obj);await loadSettings();alert('Настройки сохранены')}
@@ -1252,16 +1341,55 @@ function clearPaths(){['input_path','output_path','temp_path','failed_path'].for
 async function resetSettings(){if(!confirm('Сбросить настройки к пустым путям и безопасным значениям?'))return;settingsCache=await postJson('/api/settings/reset',{});renderSettings();alert('Настройки сброшены')}
 async function clearStats(){if(!confirm('Очистить очередь, историю сканирования и логи приложения? Видео не удаляются.'))return;await postJson('/api/jobs/clear',{});await refresh();alert('Статистика очищена')}
 function selectAllExt(on){document.querySelectorAll('.extBox').forEach(x=>x.checked=on);applyExtSelection()}
-function applyExtSelection(){let arr=[...document.querySelectorAll('.extBox:checked')].map(x=>x.value);setVal('allowed_extensions',arr.join(','))}
+function applyExtSelection(){let arr=[...document.querySelectorAll('.extBox:checked')].map(x=>x.value);setVal('allowed_extensions',arr.join(','));updateDynamicPreview()}
+function parseList(v){return String(v||'').split(',').map(x=>x.trim().toLowerCase().replace(/^\./,'')).filter(Boolean)}
+function humanBytes(n){n=Number(n||0);let u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return i===0?Math.round(n)+u[i]:n.toFixed(1)+u[i]}
 function drawPie(stats){let total=stats.reduce((a,x)=>a+x.count,0);let acc=0;let parts=[];stats.forEach((x,i)=>{let a=acc/total*100;acc+=x.count;let b=acc/total*100;parts.push(colors[i%colors.length]+' '+a+'% '+b+'%')});document.getElementById('pie').style.background=total?'conic-gradient('+parts.join(',')+')':'#102126'}
 function renderExtChecks(stats){let allowed=(document.getElementById('set_allowed_extensions')?.value||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);let all=!allowed.length;document.getElementById('extChecks').innerHTML=stats.map((x,i)=>'<label class="check"><input class="extBox" type="checkbox" value="'+esc(x.name)+'" '+(all||allowed.includes(x.name)?'checked':'')+' onchange="applyExtSelection()"><span class="sw" style="background:'+colors[i%colors.length]+'"></span><span>.'+esc(x.name)+' · '+x.count+' шт · '+esc(x.bytes_h)+'</span></label>').join('')}
-function renderPreviewResult(d){previewData=d;if(!d||!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+((d&&d.error)||'неизвестная ошибка')+'\n\nВыбранный путь: '+((d&&d.input_path)||'')+'\nПуть внутри контейнера: '+((d&&d.container_input_path)||'')+'\n\n'+(((d&&d.warnings)||[]).join('\n'));return}drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);let text='Сканирование завершено.\n\nВыбранный путь: '+(d.input_path||'')+'\nПуть внутри контейнера: '+(d.container_input_path||'')+'\n\nВсего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\nПодходит под текущие фильтры: '+d.matched+'\nОбъём подходящих: '+d.source_h+'\nНе подходит: '+d.skipped+'\n';if(d.warnings?.length)text+='\nПредупреждения:\n'+d.warnings.map(x=>'- '+x).join('\n')+'\n';if(d.ext_stats?.length)text+='\nФорматы:\n'+d.ext_stats.map(x=>'- .'+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.codec_stats?.length)text+='\nКодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.samples?.length)text+='\nПримеры подходящих файлов:\n'+d.samples.slice(0,10).map(x=>'- '+x.size_h+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path).join('\n');document.getElementById('previewSummary').textContent=text}
-async function previewFilters(){let obj=collectSettings();document.getElementById('previewSummary').textContent='Запускаю сканирование...';let start=await postJson('/api/preview/start',obj);if(!start.ok){document.getElementById('previewSummary').textContent='Не удалось запустить сканирование: '+(start.error||'unknown');return}for(let i=0;i<100000;i++){let stt=await getJson('/api/preview/status');let elapsed=stt.elapsed_seconds||0;let text='Статус: '+(stt.state||'')+'\n'+(stt.message||'')+'\n\nПросканировано: '+(stt.scanned||0)+' файлов\nПодходит: '+(stt.matched||0)+'\nНе подходит: '+(stt.skipped||0)+'\nВремя: '+elapsed+' сек.\n\nТекущий файл:\n'+(stt.current_path||'');document.getElementById('previewSummary').textContent=text;if(!stt.running){if(stt.result){renderPreviewResult(stt.result)}else if(stt.error){document.getElementById('previewSummary').textContent='Ошибка сканирования: '+stt.error}break}await new Promise(r=>setTimeout(r,700))}}
+function localPasses(file, settings){
+  if(!file || !file.probe_ok)return false;
+  let allowed=parseList(settings.allowed_extensions); if(allowed.length && !allowed.includes(String(file.ext||'').toLowerCase()))return false;
+  let codec=String(file.codec||'unknown').toLowerCase();
+  let width=Number(file.width||0), height=Number(file.height||0), dur=Number(file.duration||0), size=Number(file.size||0);
+  let minD=Number(settings.min_duration_seconds||0), maxD=Number(settings.max_duration_seconds||0);
+  let minMB=Number(settings.min_size_mb||0), maxMB=Number(settings.max_size_mb||0);
+  let minW=Number(settings.filter_min_width||0), maxW=Number(settings.filter_max_width||0);
+  let minH=Number(settings.filter_min_height||0), maxH=Number(settings.filter_max_height||0);
+  if(minD && dur < minD)return false; if(maxD && dur > maxD)return false;
+  if(minMB && size < minMB*1048576)return false; if(maxMB && size > maxMB*1048576)return false;
+  if(minW && width < minW)return false; if(maxW && width > maxW)return false;
+  if(minH && height < minH)return false; if(maxH && height > maxH)return false;
+  let inc=String(settings.include_pattern||'').toLowerCase().trim(); let exc=String(settings.exclude_pattern||'').toLowerCase().trim(); let path=String(file.path||'').toLowerCase();
+  if(inc && !path.includes(inc))return false; if(exc && path.includes(exc))return false;
+  if(codec==='hevc'){
+    let tooLarge=width>Number(settings.max_width||4096)||height>Number(settings.max_height||2048);
+    return tooLarge || String(settings.hevc_action||'move')!=='skip';
+  }
+  let pc=parseList(settings.process_codecs); return pc.includes(codec) || (codec==='unknown' && pc.includes('unknown'));
+}
+function buildLocalStats(files, settings){let matched=[], skipped=0, bytes=0, extMap={};for(let f of (files||[])){let ok=localPasses(f,settings);if(ok){matched.push(f);bytes+=Number(f.size||0);extMap[f.ext]=(extMap[f.ext]||0)+1}else skipped++}return {matched,skipped,bytes,extMap}}
+function updateDynamicPreview(){
+  let box=document.getElementById('dynamicPreview'); if(!box)return;
+  if(!previewData || !previewData.ok || !previewData.all_files){box.innerHTML='';return;}
+  let st=collectSettings(); let files=previewData.all_files||[]; let res=buildLocalStats(files,st);
+  let total=files.length; let match=res.matched.length; let skipped=res.skipped;
+  let textExt=Object.entries(res.extMap).sort((a,b)=>b[1]-a[1]).map(x=>'.'+x[0]+': '+x[1]).join(' · ') || 'ничего не выбрано';
+  box.innerHTML='<div class="card"><h3>Всего найдено при скане</h3><div class="big">'+total+'</div><div class="small">это всё, что приложение смогло распознать как видео</div></div>'+
+    '<div class="card"><h3>Будет обработано по текущим настройкам</h3><div class="big cyan">'+match+'</div><div class="small">пересчитывается без нового сканирования</div></div>'+
+    '<div class="card"><h3>Не попадёт в обработку</h3><div class="big warn">'+skipped+'</div><div class="small">не прошло форматы/кодеки/размер/длительность/разрешение</div></div>'+
+    '<div class="card span3"><h3>Подходящий объём и форматы</h3><div class="big ok">'+humanBytes(res.bytes)+'</div><div class="small">'+esc(textExt)+'</div></div>';
+  let summary=document.getElementById('previewSummary');
+  if(summary && previewData.lastText){
+    summary.textContent=previewData.lastText+'\n\nДИНАМИЧЕСКИЙ ПЕРЕСЧЁТ ПО ТЕКУЩИМ НАСТРОЙКАМ:\nБудет обработано: '+match+' из '+total+' файлов\nПодходящий объём: '+humanBytes(res.bytes)+'\nНе попадёт в обработку: '+skipped+'\nФорматы в обработке: '+textExt;
+  }
+}
+function renderPreviewResult(d){previewData=d;if(!d||!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+((d&&d.error)||'неизвестная ошибка')+'\n\nВыбранный путь: '+((d&&d.input_path)||'')+'\nПуть внутри контейнера: '+((d&&d.container_input_path)||'')+'\n\n'+(((d&&d.warnings)||[]).join('\n'));return}drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);let text='Сканирование завершено.\n\nЧто значит “Будет обработано”: это не просто найденные форматы, а файлы, которые сейчас проходят выбранные фильтры ниже: расширения, кодеки, разрешение, длительность и размер. Если поменяешь настройки — число пересчитается сразу, без нового скана.\n\nВыбранный путь: '+(d.input_path||'')+'\nПуть внутри контейнера: '+(d.container_input_path||'')+'\n\nВсего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\nБудет обработано по настройкам на момент скана: '+d.matched+'\nОбъём подходящих на момент скана: '+d.source_h+'\nНе подходит на момент скана: '+d.skipped+'\n';if(d.warnings?.length)text+='\nПредупреждения:\n'+d.warnings.map(x=>'- '+x).join('\n')+'\n';if(d.ext_stats?.length)text+='\nВсе найденные форматы:\n'+d.ext_stats.map(x=>'- .'+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.codec_stats?.length)text+='\nВсе найденные кодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.samples?.length)text+='\nПримеры подходящих файлов на момент скана:\n'+d.samples.slice(0,10).map(x=>'- '+x.size_h+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path).join('\n');previewData.lastText=text;document.getElementById('previewSummary').textContent=text;updateDynamicPreview()}
+async function previewFilters(){let obj=collectSettings();document.getElementById('previewSummary').textContent='Запускаю сканирование...';document.getElementById('dynamicPreview').innerHTML='<div class="card span3"><h3>Сканирование</h3><div class="big cyan">запуск...</div><div class="small">сейчас появится прогресс</div></div>';let start=await postJson('/api/preview/start',obj);if(!start.ok){document.getElementById('previewSummary').textContent='Не удалось запустить сканирование: '+(start.error||'unknown');return}for(let i=0;i<100000;i++){let stt=await getJson('/api/preview/status');let elapsed=stt.elapsed_seconds||0;let text='Статус: '+(stt.state||'')+'\n'+(stt.message||'')+'\n\nПросканировано: '+(stt.scanned||0)+' файлов\nПодходит сейчас: '+(stt.matched||0)+'\nНе подходит сейчас: '+(stt.skipped||0)+'\nВремя: '+elapsed+' сек.\n\nТекущий файл:\n'+(stt.current_path||'');document.getElementById('previewSummary').textContent=text;document.getElementById('dynamicPreview').innerHTML='<div class="card"><h3>Сканирование</h3><div class="big cyan">'+(stt.scanned||0)+'</div><div class="small">файлов просмотрено</div></div><div class="card"><h3>Подходит сейчас</h3><div class="big ok">'+(stt.matched||0)+'</div><div class="small">по фильтрам на момент запуска</div></div><div class="card"><h3>Не подходит</h3><div class="big warn">'+(stt.skipped||0)+'</div><div class="small">пропущено фильтрами</div></div>';if(!stt.running){if(stt.result){renderPreviewResult(stt.result)}else if(stt.error){document.getElementById('previewSummary').textContent='Ошибка сканирования: '+stt.error}break}await new Promise(r=>setTimeout(r,700))}}
 async function loadJobs(){let stv=document.getElementById('jobStatus').value;let data=await getJson('/api/jobs?limit=500'+(stv?'&status='+encodeURIComponent(stv):''));document.getElementById('jobsBody').innerHTML=data.jobs.map(j=>'<tr><td><span class="pill">'+esc(st(j.status))+'</span></td><td>'+esc(j.progress_percent||0)+'%</td><td class="path mono">'+fmtPath(j.source_path)+'</td><td class="path mono">'+fmtPath(j.output_path)+'</td><td>'+esc(j.source_size_h)+' → '+esc(j.output_size_h)+'</td><td class="path">'+esc(j.error_message||'')+'</td><td><button class="btn" onclick="retryJob(\''+j.id+'\')">повторить</button> <button class="btn yellow" onclick="moveFailed(\''+j.id+'\')">в failed</button></td></tr>').join('')}
 async function retryJob(id){await postJson('/api/jobs/'+id+'/retry',{});loadJobs()} async function moveFailed(id){await postJson('/api/jobs/'+id+'/move-to-failed',{});loadJobs()} async function loadLogs(kind){let d=await getJson('/api/logs?kind='+kind+'&lines=300');document.getElementById('logBox').textContent=d.text||''}
 function openBrowser(target,mode){browserTarget=target;browserMode=mode;document.getElementById('browserModal').classList.add('show');browseTo(document.getElementById('set_'+target)?.value||'')}function closeBrowser(){document.getElementById('browserModal').classList.remove('show')}
 async function browseTo(path){let d=await getJson('/api/fs?path='+encodeURIComponent(path||''));browserCurrent=d.path||'';document.getElementById('browserPath').value=browserCurrent;let html='';if(d.parent){html+='<div class="fileitem" onclick="browseTo('+esc(jsq(d.parent))+')"><div>⬆️</div><div>..</div><div></div><div></div></div>'}if(d.error){html+='<div class="fileitem"><div>⚠️</div><div>'+esc(d.error)+'</div><div></div><div></div></div>'}(d.entries||[]).forEach(e=>{let icon=e.is_dir?'📁':'🎞️';let click=e.is_dir?'browseTo('+esc(jsq(e.path))+')':'selectFile('+esc(jsq(e.path))+')';html+='<div class="fileitem" onclick="'+click+'"><div>'+icon+'</div><div class="mono">'+esc(e.name)+'</div><div class="muted">'+esc(e.type)+'</div><div class="muted">'+esc(e.size_h||'')+'</div></div>'});document.getElementById('browserList').innerHTML=html||'<div class="fileitem"><div></div><div>Пусто</div><div></div><div></div></div>'}
-function selectFile(path){if(browserMode==='file'){document.getElementById('set_'+browserTarget).value=path;closeBrowser()}else{browseTo(path)}} function selectCurrentFolder(){if(browserTarget){document.getElementById('set_'+browserTarget).value=browserCurrent;closeBrowser()}}
+function selectFile(path){if(browserMode==='file'){document.getElementById('set_'+browserTarget).value=path;closeBrowser()}else{browseTo(path)}} function selectCurrentFolder(){if(browserTarget){document.getElementById('set_'+browserTarget).value=browserCurrent;closeBrowser();settingsChanged()}}
 setInterval(refresh,2000); refresh();
 </script>
 </body>
