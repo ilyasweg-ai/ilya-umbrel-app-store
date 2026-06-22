@@ -13,7 +13,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "app.sqlite")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -22,10 +22,11 @@ FFMPEG_LOG = os.path.join(LOG_DIR, "ffmpeg.log")
 APP_LOG = os.path.join(LOG_DIR, "app.log")
 HOST_EXTERNAL_ROOT = os.environ.get("HOST_EXTERNAL_ROOT", "/home/umbrel/umbrel/external").rstrip("/")
 MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/media").rstrip("/")
+HOST_ROOT = os.environ.get("HOST_ROOT", "/host").rstrip("/")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm"}
 SUCCESS_STATUSES = {"success", "skip_ok", "moved_already_hevc", "copied_already_hevc", "hardlinked_already_hevc", "manual_ok"}
-TERMINAL_STATUSES = SUCCESS_STATUSES | {"moved_to_failed", "skipped", "deleted"}
+TERMINAL_STATUSES = SUCCESS_STATUSES | {"moved_to_failed", "failed_terminal", "skipped", "deleted"}
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -40,13 +41,15 @@ last_scan_at = 0
 last_worker_error = ""
 
 DEFAULT_SETTINGS = {
+    # По умолчанию ничего не запускаем и не выбираем, чтобы приложение не трогало случайные папки.
     "worker_enabled": True,
-    "auto_convert_enabled": True,
-    "input_path": "/media/ssd990_main/porn",
-    "output_path": "/media/ssd990_main/new",
-    "failed_path": "/media/ssd990_main/failed_convert",
+    "auto_convert_enabled": False,
+    "input_path": "",
+    "output_path": "",
+    "use_failed_path": False,
+    "failed_path": "",
     "use_temp_path": False,
-    "temp_path": "/media/ssd990_main/new/.tmp",
+    "temp_path": "",
     "preserve_input_folder": True,
     "scan_interval_seconds": 30,
     "stable_check_seconds": 20,
@@ -58,6 +61,10 @@ DEFAULT_SETTINGS = {
     "max_duration_seconds": 0,
     "min_size_mb": 0,
     "max_size_mb": 0,
+    "filter_min_width": 0,
+    "filter_max_width": 0,
+    "filter_min_height": 0,
+    "filter_max_height": 0,
     "process_codecs": "h264,mpeg4,vp9,av1,unknown",
     "hevc_action": "move",  # skip, move, copy, hardlink
     "max_width": 4096,
@@ -124,7 +131,7 @@ def save_settings(data):
 
 
 def normalize_settings_inplace(s):
-    for key in ["scan_interval_seconds", "stable_check_seconds", "stable_check_count", "max_width", "max_height", "crf", "ffmpeg_threads", "max_retries"]:
+    for key in ["scan_interval_seconds", "stable_check_seconds", "stable_check_count", "max_width", "max_height", "crf", "ffmpeg_threads", "max_retries", "filter_min_width", "filter_max_width", "filter_min_height", "filter_max_height"]:
         try:
             s[key] = int(s.get(key, DEFAULT_SETTINGS[key]))
         except Exception:
@@ -134,16 +141,34 @@ def normalize_settings_inplace(s):
             s[key] = float(s.get(key, DEFAULT_SETTINGS[key]))
         except Exception:
             s[key] = DEFAULT_SETTINGS[key]
-    for key in ["worker_enabled", "auto_convert_enabled", "use_temp_path", "preserve_input_folder", "scale_if_too_large", "copy_metadata", "copy_chapters", "faststart", "move_failed_after_retries", "delete_source_after_success", "auto_safe_retry", "safe_remux_to_mp4", "allow_mkv_fallback"]:
+    for key in ["worker_enabled", "auto_convert_enabled", "use_failed_path", "use_temp_path", "preserve_input_folder", "scale_if_too_large", "copy_metadata", "copy_chapters", "faststart", "move_failed_after_retries", "delete_source_after_success", "auto_safe_retry", "safe_remux_to_mp4", "allow_mkv_fallback"]:
         s[key] = bool(s.get(key, DEFAULT_SETTINGS[key]))
 
 
 def to_container_path(path):
+    """Convert a user-entered path to a path visible inside the container.
+
+    Supported forms:
+    - /media/... is the mounted Umbrel external storage.
+    - /host/... is the mounted host root.
+    - raw host paths like /home/umbrel/... are mapped to /host/home/umbrel/...
+      unless they belong to UMBREL_ROOT/external, where /media is preferred.
+    """
     if not path:
+        return ""
+    path = str(path).strip()
+    if not path:
+        return ""
+    if path.startswith(MEDIA_ROOT + "/") or path == MEDIA_ROOT:
         return path
-    path = path.strip()
-    if path.startswith(HOST_EXTERNAL_ROOT + "/"):
+    if path.startswith(HOST_ROOT + "/") or path == HOST_ROOT:
+        return path
+    if path.startswith(HOST_EXTERNAL_ROOT + "/") or path == HOST_EXTERNAL_ROOT:
         return MEDIA_ROOT + path[len(HOST_EXTERNAL_ROOT):]
+    if path.startswith("/"):
+        candidate = HOST_ROOT + path
+        if os.path.exists(candidate):
+            return candidate
     return path
 
 
@@ -362,12 +387,25 @@ def file_is_stable(path, settings):
     return False
 
 
-def compute_output_path(src, settings, info, force_ext=None, suffix=None):
-    input_path = to_container_path(settings.get("input_path", DEFAULT_SETTINGS["input_path"])).rstrip("/")
-    output_root = to_container_path(settings.get("output_path", DEFAULT_SETTINGS["output_path"])).rstrip("/")
-    rel = safe_rel(src, input_path)
-    if settings.get("preserve_input_folder", True):
+def input_base_for_rel(settings):
+    input_path = to_container_path(settings.get("input_path", "")).rstrip("/")
+    if input_path and os.path.isfile(input_path):
+        return os.path.dirname(input_path)
+    return input_path
+
+
+def output_rel_for_source(src, settings):
+    input_path = to_container_path(settings.get("input_path", "")).rstrip("/")
+    base = input_base_for_rel(settings)
+    rel = safe_rel(src, base) if base else os.path.basename(src)
+    if settings.get("preserve_input_folder", True) and input_path and os.path.isdir(input_path):
         rel = os.path.basename(input_path) + "/" + rel
+    return rel
+
+
+def compute_output_path(src, settings, info, force_ext=None, suffix=None):
+    output_root = to_container_path(settings.get("output_path", "")).rstrip("/")
+    rel = output_rel_for_source(src, settings)
     rel_dir = os.path.dirname(rel)
     base = os.path.basename(rel)
     name, ext = os.path.splitext(base)
@@ -378,6 +416,12 @@ def compute_output_path(src, settings, info, force_ext=None, suffix=None):
             suffix = f"_{settings.get('max_width',4096)}x{settings.get('max_height',2048)}_h265"
     ext_out = force_ext or "." + str(settings.get("container", "mp4")).lstrip(".")
     return os.path.join(output_root, rel_dir, name + suffix + ext_out)
+
+
+def compute_passthrough_output_path(src, settings):
+    output_root = to_container_path(settings.get("output_path", "")).rstrip("/")
+    rel = output_rel_for_source(src, settings)
+    return os.path.join(output_root, rel)
 
 
 def temp_for_output(dst, settings):
@@ -404,33 +448,141 @@ def should_include_file(path, settings):
     return True
 
 
-def scan_files():
-    global last_scan_at
-    settings = load_settings()
-    input_path = to_container_path(settings.get("input_path", DEFAULT_SETTINGS["input_path"]))
+def passes_probe_filters(info, settings):
+    if not info:
+        return False
+    dur = float(info.get("duration") or 0)
+    size = int(info.get("size") or 0)
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    codec = str(info.get("codec") or "unknown").lower()
+    min_d = float(settings.get("min_duration_seconds", 0) or 0)
+    max_d = float(settings.get("max_duration_seconds", 0) or 0)
+    min_mb = float(settings.get("min_size_mb", 0) or 0)
+    max_mb = float(settings.get("max_size_mb", 0) or 0)
+    min_w = int(settings.get("filter_min_width", 0) or 0)
+    max_w = int(settings.get("filter_max_width", 0) or 0)
+    min_h = int(settings.get("filter_min_height", 0) or 0)
+    max_h = int(settings.get("filter_max_height", 0) or 0)
+    if min_d and dur < min_d: return False
+    if max_d and dur > max_d: return False
+    if min_mb and size < min_mb * 1048576: return False
+    if max_mb and size > max_mb * 1048576: return False
+    if min_w and width < min_w: return False
+    if max_w and width > max_w: return False
+    if min_h and height < min_h: return False
+    if max_h and height > max_h: return False
+    # HEVC is still selectable when action is not skip or when it must be scaled.
+    if codec == "hevc":
+        too_large = width > int(settings.get("max_width", 4096)) or height > int(settings.get("max_height", 2048))
+        return too_large or str(settings.get("hevc_action", "move")) != "skip"
+    process_codecs = split_csv(settings.get("process_codecs"))
+    return codec in process_codecs or (codec == "unknown" and "unknown" in process_codecs)
+
+
+def iter_source_files(settings):
+    input_path = to_container_path(settings.get("input_path", ""))
+    if not input_path:
+        return
+    outp = os.path.abspath(to_container_path(settings.get("output_path", "") or "/__no_output__"))
+    failp = os.path.abspath(to_container_path(settings.get("failed_path", "") or "/__no_failed__"))
+    if os.path.isfile(input_path):
+        if should_include_file(input_path, settings):
+            yield input_path
+        return
     if not os.path.isdir(input_path):
-        last_scan_at = time.time()
-        return 0
-    count = 0
+        return
     for root, dirs, files in os.walk(input_path):
-        # never walk output or failed if user accidentally nested them
-        outp = os.path.abspath(to_container_path(settings.get("output_path", "")))
-        failp = os.path.abspath(to_container_path(settings.get("failed_path", "")))
         absroot = os.path.abspath(root)
-        if absroot.startswith(outp + os.sep) or absroot == outp or absroot.startswith(failp + os.sep) or absroot == failp:
+        if (outp and (absroot == outp or absroot.startswith(outp + os.sep))) or (failp and (absroot == failp or absroot.startswith(failp + os.sep))):
             dirs[:] = []
             continue
         for name in files:
             p = os.path.join(root, name)
-            if not should_include_file(p, settings):
+            if should_include_file(p, settings):
+                yield p
+
+
+def preview_payload(settings):
+    settings = save_settings(settings) if False else dict(load_settings(), **(settings or {}))
+    normalize_settings_inplace(settings)
+    scanned = 0
+    matched = 0
+    skipped = 0
+    total_bytes = 0
+    samples = []
+    warnings = []
+    input_path = to_container_path(settings.get("input_path", ""))
+    if not input_path:
+        return {"ok": False, "error": "Не выбран входящий файл или папка", "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "samples": [], "warnings": []}
+    if not os.path.exists(input_path):
+        return {"ok": False, "error": "Входящий путь не существует: " + input_path, "scanned": 0, "matched": 0, "skipped": 0, "source_bytes": 0, "source_h": fmt_bytes(0), "samples": [], "warnings": []}
+    limit = int(settings.get("preview_probe_limit", 3000) or 3000)
+    for p in iter_source_files(settings):
+        scanned += 1
+        if scanned > limit:
+            warnings.append(f"Предпросмотр остановлен на лимите {limit} файлов")
+            break
+        info, err = get_video_info(p)
+        if info and passes_probe_filters(info, settings):
+            matched += 1
+            total_bytes += int(info.get("size") or 0)
+            if len(samples) < 20:
+                samples.append({"path": p, "codec": info.get("codec"), "width": info.get("width"), "height": info.get("height"), "duration": round(float(info.get("duration") or 0), 1), "size_h": fmt_bytes(info.get("size") or 0)})
+        else:
+            skipped += 1
+    return {"ok": True, "scanned": scanned, "matched": matched, "skipped": skipped, "source_bytes": total_bytes, "source_h": fmt_bytes(total_bytes), "samples": samples, "warnings": warnings}
+
+
+def list_path(path):
+    if not path:
+        roots = [
+            {"name": "Внешние диски Umbrel (/media)", "path": MEDIA_ROOT, "is_dir": True, "type": "dir"},
+            {"name": "Вся система хоста (/host)", "path": HOST_ROOT, "is_dir": True, "type": "dir"},
+            {"name": "Данные приложения (/data)", "path": DATA_DIR, "is_dir": True, "type": "dir"},
+        ]
+        return {"path": "", "parent": "", "entries": roots}
+    path = to_container_path(unquote(path))
+    if os.path.isfile(path):
+        parent = os.path.dirname(path)
+        return {"path": path, "parent": parent, "entries": []}
+    if not os.path.isdir(path):
+        return {"path": path, "parent": os.path.dirname(path), "entries": [], "error": "Папка не найдена или нет доступа"}
+    entries = []
+    try:
+        names = sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+        for name in names[:1000]:
+            full = os.path.join(path, name)
+            try:
+                is_dir = os.path.isdir(full)
+                is_file = os.path.isfile(full)
+                size = os.path.getsize(full) if is_file else 0
+            except Exception:
                 continue
-            existing = get_existing_job_for_source(p)
-            if existing and existing.get("status") in TERMINAL_STATUSES:
-                continue
-            if existing and existing.get("status") in {"pending", "waiting_file_copy", "probing", "converting"}:
-                continue
-            upsert_job(p)
-            count += 1
+            if is_dir or is_file:
+                entries.append({"name": name, "path": full, "is_dir": is_dir, "is_file": is_file, "type": "dir" if is_dir else "file", "size_h": fmt_bytes(size)})
+    except Exception as e:
+        return {"path": path, "parent": os.path.dirname(path), "entries": [], "error": str(e)}
+    return {"path": path, "parent": os.path.dirname(path.rstrip('/')) if path not in ('/', HOST_ROOT, MEDIA_ROOT) else "", "entries": entries}
+
+
+def scan_files():
+    global last_scan_at
+    settings = load_settings()
+    input_path = to_container_path(settings.get("input_path", ""))
+    output_path = to_container_path(settings.get("output_path", ""))
+    if not input_path or not os.path.exists(input_path) or not output_path:
+        last_scan_at = time.time()
+        return 0
+    count = 0
+    for p in iter_source_files(settings):
+        existing = get_existing_job_for_source(p)
+        if existing and existing.get("status") in TERMINAL_STATUSES:
+            continue
+        if existing and existing.get("status") in {"pending", "waiting_file_copy", "probing", "converting"}:
+            continue
+        upsert_job(p)
+        count += 1
     last_scan_at = time.time()
     return count
 
@@ -560,9 +712,15 @@ def remux_mkv_to_mp4(mkv, mp4):
 
 def move_to_failed(job, settings, reason):
     src = job["source_path"]
-    failed_root = to_container_path(settings.get("failed_path", DEFAULT_SETTINGS["failed_path"]))
-    input_path = to_container_path(settings.get("input_path", DEFAULT_SETTINGS["input_path"]))
-    rel = safe_rel(src, input_path)
+    if not settings.get("use_failed_path", False):
+        update_job(job["id"], status="failed_terminal", error_message=reason + "; карантин выключен", finished_at=now_iso())
+        return
+    failed_root = to_container_path(settings.get("failed_path", ""))
+    if not failed_root:
+        update_job(job["id"], status="failed_terminal", error_message=reason + "; папка карантина не выбрана", finished_at=now_iso())
+        return
+    base = input_base_for_rel(settings)
+    rel = safe_rel(src, base) if base else os.path.basename(src)
     dst = os.path.join(failed_root, rel)
     try:
         ensure_parent(dst)
@@ -570,12 +728,15 @@ def move_to_failed(job, settings, reason):
             shutil.move(src, dst)
         update_job(job["id"], status="moved_to_failed", output_path=dst, error_message=reason, finished_at=now_iso())
     except Exception as e:
-        update_job(job["id"], status="failed", error_message=f"failed move to quarantine: {e}; original error: {reason}", finished_at=now_iso())
+        update_job(job["id"], status="failed_terminal", error_message=f"failed move to quarantine: {e}; original error: {reason}", finished_at=now_iso())
 
 
 def process_job(job):
     settings = load_settings()
     src = job["source_path"]
+    if not to_container_path(settings.get("output_path", "")):
+        update_job(job["id"], status="failed_terminal", error_message="Не выбрана выходная папка", finished_at=now_iso())
+        return
     if not os.path.exists(src):
         update_job(job["id"], status="skipped", error_message="source no longer exists", finished_at=now_iso())
         return
@@ -588,15 +749,10 @@ def process_job(job):
     if not info:
         update_job(job["id"], status="skipped", error_message="ffprobe failed: " + err, finished_at=now_iso())
         return
-    # Filter by duration and size
     dur = float(info.get("duration") or 0)
     size = int(info.get("size") or 0)
-    min_d = float(settings.get("min_duration_seconds", 0) or 0)
-    max_d = float(settings.get("max_duration_seconds", 0) or 0)
-    min_mb = float(settings.get("min_size_mb", 0) or 0)
-    max_mb = float(settings.get("max_size_mb", 0) or 0)
-    if min_d and dur < min_d or max_d and dur > max_d or min_mb and size < min_mb*1048576 or max_mb and size > max_mb*1048576:
-        update_job(job["id"], status="skipped", source_codec=info["codec"], source_width=info["width"], source_height=info["height"], source_duration=dur, source_size_bytes=size, error_message="filtered out", finished_at=now_iso())
+    if not passes_probe_filters(info, settings):
+        update_job(job["id"], status="skipped", source_codec=info["codec"], source_width=info["width"], source_height=info["height"], source_duration=dur, source_size_bytes=size, error_message="Не подходит под фильтры", finished_at=now_iso())
         return
     update_job(job["id"], source_codec=info["codec"], source_width=info["width"], source_height=info["height"], source_duration=dur, source_size_bytes=size)
     codec = info["codec"].lower()
@@ -604,7 +760,7 @@ def process_job(job):
     # already hevc and no scale required
     if codec == "hevc" and not too_large:
         action = str(settings.get("hevc_action", "move"))
-        dst = os.path.join(to_container_path(settings.get("output_path")), os.path.basename(to_container_path(settings.get("input_path")).rstrip("/")), safe_rel(src, to_container_path(settings.get("input_path")))) if settings.get("preserve_input_folder", True) else os.path.join(to_container_path(settings.get("output_path")), safe_rel(src, to_container_path(settings.get("input_path"))))
+        dst = compute_passthrough_output_path(src, settings)
         ensure_parent(dst)
         try:
             if os.path.exists(dst) and is_valid_video(dst):
@@ -772,7 +928,7 @@ def stats_payload():
         elif st == "converting":
             converting += 1
             current = row_to_dict(r)
-        elif st in {"failed", "moved_to_failed"}:
+        elif st in {"failed", "failed_terminal", "moved_to_failed"}:
             failed += 1
     active_job = current
     saved = max(0, orig - out)
@@ -809,85 +965,80 @@ INDEX_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Auto H265 Converter</title>
+  <title>Авто H.265 Конвертер</title>
   <style>
     :root{--bg:#081114;--panel:#111c20;--panel2:#16262b;--text:#e8f2f2;--muted:#96a6a8;--cyan:#22d3ee;--green:#22c55e;--yellow:#f59e0b;--red:#ef4444;--border:#26373d;--blue:#60a5fa}
-    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top,#12343b,#081114 40%);font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;color:var(--text)}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top,#12343b,#081114 42%);font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;color:var(--text)}
     header{padding:22px 28px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:rgba(8,17,20,.72);backdrop-filter: blur(8px);position:sticky;top:0;z-index:5}
-    h1{font-size:22px;margin:0}.tag{font-size:12px;color:var(--muted)}
-    main{padding:24px;max-width:1500px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card{background:linear-gradient(180deg,var(--panel),#0d171a);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+    h1{font-size:22px;margin:0}.tag{font-size:12px;color:var(--muted)}main{padding:24px;max-width:1600px;margin:0 auto}
+    .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card{background:linear-gradient(180deg,var(--panel),#0d171a);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
     .card h3{margin:0 0 10px;color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.08em}.big{font-size:30px;font-weight:800}.small{font-size:13px;color:var(--muted)}
     .ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}.blue{color:var(--blue)}.cyan{color:var(--cyan)}
     .bar{height:12px;background:#071013;border:1px solid var(--border);border-radius:999px;overflow:hidden}.bar>div{height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));width:0%}
-    .section{margin-top:18px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.btn{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:9px 13px;cursor:pointer;font-weight:700}.btn:hover{border-color:var(--cyan)}.btn.green{background:#0f2d1b;border-color:#166534}.btn.red{background:#321316;border-color:#7f1d1d}.btn.yellow{background:#2f250c;border-color:#854d0e}
-    input,select,textarea{width:100%;background:#071013;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:9px}label{font-size:12px;color:var(--muted);display:block;margin-bottom:5px}.formgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.span2{grid-column:span 2}.span4{grid-column:span 4}
-    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px;border-bottom:1px solid var(--border);vertical-align:top}th{text-align:left;color:var(--muted);font-size:12px}td.path{max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pill{padding:3px 8px;border-radius:999px;background:#102126;border:1px solid var(--border);font-size:12px}.tabs{display:flex;gap:10px;margin-bottom:14px}.hidden{display:none}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.log{white-space:pre-wrap;background:#071013;border:1px solid var(--border);border-radius:12px;padding:12px;max-height:420px;overflow:auto;color:#cbd5e1}
-    @media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.formgrid{grid-template-columns:1fr}.span2,.span4{grid-column:span 1}}@media(max-width:640px){.grid{grid-template-columns:1fr}main{padding:14px}header{padding:16px}}
+    .section{margin-top:18px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.btn{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:9px 13px;cursor:pointer;font-weight:700}.btn:hover{border-color:var(--cyan)}.btn.green{background:#0f2d1b;border-color:#166534}.btn.red{background:#321316;border-color:#7f1d1d}.btn.yellow{background:#2f250c;border-color:#854d0e}.btn:disabled{opacity:.45;cursor:not-allowed}
+    input,select,textarea{width:100%;background:#071013;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:9px}input:disabled,select:disabled{opacity:.5;background:#0b1113}label{font-size:12px;color:var(--muted);display:block;margin-bottom:5px}.formgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.span2{grid-column:span 2}.span4{grid-column:span 4}
+    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px;border-bottom:1px solid var(--border);vertical-align:top}th{text-align:left;color:var(--muted);font-size:12px}td.path{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pill{padding:3px 8px;border-radius:999px;background:#102126;border:1px solid var(--border);font-size:12px}.hidden{display:none}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.log{white-space:pre-wrap;background:#071013;border:1px solid var(--border);border-radius:12px;padding:12px;max-height:420px;overflow:auto;color:#cbd5e1}
+    .hint{border-left:3px solid var(--cyan);padding:10px 12px;background:#09181c;border-radius:10px;color:#b8c6c8}.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:20;display:none;align-items:center;justify-content:center}.modal.show{display:flex}.modalbox{width:min(980px,92vw);max-height:84vh;background:#0d171a;border:1px solid var(--border);border-radius:18px;padding:16px;box-shadow:0 20px 80px rgba(0,0,0,.45)}.filelist{max-height:54vh;overflow:auto;border:1px solid var(--border);border-radius:12px}.fileitem{display:grid;grid-template-columns:32px 1fr 110px 110px;gap:8px;padding:9px 12px;border-bottom:1px solid #1c2b31;cursor:pointer}.fileitem:hover{background:#122329}.fileitem .muted{color:var(--muted)}
+    @media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.formgrid{grid-template-columns:1fr}.span2,.span4{grid-column:span 1}}@media(max-width:640px){.grid{grid-template-columns:1fr}main{padding:14px}header{padding:16px}.fileitem{grid-template-columns:28px 1fr}}
   </style>
 </head>
 <body>
-<header><div><h1>Auto H265 Converter</h1><div class="tag">Umbrel video converter · H.264 → H.265 · live progress</div></div><div class="row"><button class="btn" onclick="showTab('dashboard')">Dashboard</button><button class="btn" onclick="showTab('settings')">Settings</button><button class="btn" onclick="showTab('jobs')">Queue</button><button class="btn" onclick="showTab('logs')">Logs</button></div></header>
+<header><div><h1>Авто H.265 Конвертер</h1><div class="tag">Umbrel · FFmpeg · H.264 → H.265 · живой прогресс</div></div><div class="row"><button class="btn" onclick="showTab('dashboard')">Главная</button><button class="btn" onclick="showTab('settings')">Настройки</button><button class="btn" onclick="showTab('jobs')">Очередь</button><button class="btn" onclick="showTab('logs')">Логи</button></div></header>
 <main>
   <section id="dashboard">
     <div class="grid">
       <div class="card"><h3>Общий прогресс</h3><div class="big" id="progressText">0 / 0</div><div class="bar"><div id="progressBar"></div></div><div class="small" id="progressPercent">0%</div></div>
       <div class="card"><h3>Экономия</h3><div class="big ok" id="savedText">0B</div><div class="small" id="savedPercent">0%</div></div>
       <div class="card"><h3>Объём</h3><div class="big" id="volumeText">0B → 0B</div><div class="small">исходники → результат</div></div>
-      <div class="card"><h3>Ошибки</h3><div class="big" id="failedText">0</div><div class="small" id="serviceText">service</div></div>
+      <div class="card"><h3>Ошибки</h3><div class="big" id="failedText">0</div><div class="small" id="serviceText">сервис</div></div>
     </div>
-    <div class="card section"><h3>Текущий файл</h3><div id="currentBox" class="small">IDLE</div><div class="bar" style="margin-top:12px"><div id="currentBar"></div></div></div>
-    <div class="card section"><h3>Управление</h3><div class="row"><button class="btn green" onclick="apiPost('/api/worker/resume')">Resume auto</button><button class="btn yellow" onclick="apiPost('/api/worker/pause')">Pause auto</button><button class="btn" onclick="apiPost('/api/scan')">Scan now</button><button class="btn red" onclick="apiPost('/api/worker/stop-current')">Stop current ffmpeg</button></div></div>
+    <div class="card section"><h3>Текущий файл</h3><div id="currentBox" class="small">Ожидание</div><div class="bar" style="margin-top:12px"><div id="currentBar"></div></div></div>
+    <div class="card section"><h3>Управление</h3><div class="row"><button class="btn green" onclick="apiPost('/api/worker/resume')">Включить автоконвертацию</button><button class="btn yellow" onclick="apiPost('/api/worker/pause')">Пауза</button><button class="btn" onclick="apiPost('/api/scan')">Сканировать сейчас</button><button class="btn red" onclick="apiPost('/api/worker/stop-current')">Остановить текущий FFmpeg</button></div></div>
   </section>
   <section id="settings" class="hidden">
-    <div class="card"><h3>Настройки</h3><div class="formgrid" id="settingsForm"></div><div class="row" style="margin-top:14px"><button class="btn green" onclick="saveSettings()">Save settings</button><button class="btn" onclick="loadSettings()">Reload</button></div></div>
+    <div class="card"><h3>Настройки</h3><div class="hint">По умолчанию пути пустые. Выбери входящий файл/папку и выходную папку сам. Можно выбирать /media для внешних дисков Umbrel или /host для всей файловой системы хоста.</div><div class="formgrid" id="settingsForm" style="margin-top:14px"></div><div class="row" style="margin-top:14px"><button class="btn green" onclick="saveSettings()">Сохранить настройки</button><button class="btn" onclick="loadSettings()">Перезагрузить форму</button><button class="btn" onclick="previewFilters()">Посчитать подходящие файлы</button><button class="btn yellow" onclick="clearPaths()">Очистить пути</button></div><div id="previewBox" class="log mono" style="margin-top:14px;max-height:260px">Предпросмотр фильтров ещё не запускался.</div></div>
   </section>
-  <section id="jobs" class="hidden"><div class="card"><h3>Очередь</h3><div class="row"><button class="btn" onclick="loadJobs()">Refresh</button><select id="jobStatus" style="max-width:220px" onchange="loadJobs()"><option value="">all</option><option>pending</option><option>converting</option><option>success</option><option>failed</option><option>moved_to_failed</option><option>skipped</option></select></div><div style="overflow:auto;margin-top:12px"><table><thead><tr><th>Status</th><th>Progress</th><th>Source</th><th>Output</th><th>Size</th><th>Error</th><th>Actions</th></tr></thead><tbody id="jobsBody"></tbody></table></div></div></section>
-  <section id="logs" class="hidden"><div class="card"><h3>Логи</h3><div class="row"><button class="btn" onclick="loadLogs('app')">App log</button><button class="btn" onclick="loadLogs('ffmpeg')">FFmpeg log</button></div><div class="log mono" id="logBox">...</div></div></section>
+  <section id="jobs" class="hidden"><div class="card"><h3>Очередь</h3><div class="row"><button class="btn" onclick="loadJobs()">Обновить</button><select id="jobStatus" style="max-width:240px" onchange="loadJobs()"><option value="">все</option><option value="pending">ожидает</option><option value="converting">конвертируется</option><option value="success">готово</option><option value="failed">ошибка</option><option value="failed_terminal">ошибка без повтора</option><option value="moved_to_failed">в карантине</option><option value="skipped">пропущено</option></select></div><div style="overflow:auto;margin-top:12px"><table><thead><tr><th>Статус</th><th>Прогресс</th><th>Источник</th><th>Результат</th><th>Размер</th><th>Ошибка</th><th>Действия</th></tr></thead><tbody id="jobsBody"></tbody></table></div></div></section>
+  <section id="logs" class="hidden"><div class="card"><h3>Логи</h3><div class="row"><button class="btn" onclick="loadLogs('app')">Лог приложения</button><button class="btn" onclick="loadLogs('ffmpeg')">Лог FFmpeg</button></div><div class="log mono" id="logBox">...</div></div></section>
 </main>
+<div id="browserModal" class="modal"><div class="modalbox"><div class="row" style="justify-content:space-between"><h3 id="browserTitle">Выбор пути</h3><button class="btn red" onclick="closeBrowser()">Закрыть</button></div><div class="row"><input id="browserPath" class="mono" placeholder="/media или /host"><button class="btn" onclick="browseTo(document.getElementById('browserPath').value)">Открыть</button><button class="btn" onclick="selectCurrentFolder()">Выбрать эту папку</button></div><div class="filelist" id="browserList" style="margin-top:12px"></div></div></div>
 <script>
-let settingsCache = {};
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-async function getJson(url){const r=await fetch(url);return await r.json();}
-async function postJson(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});return await r.json();}
-async function apiPost(url){await postJson(url,{}); refresh();}
-function showTab(id){['dashboard','settings','jobs','logs'].forEach(x=>document.getElementById(x).classList.toggle('hidden',x!==id)); if(id==='settings')loadSettings(); if(id==='jobs')loadJobs(); if(id==='logs')loadLogs('app');}
+let settingsCache = {}; let browserTarget = null; let browserMode='dir'; let browserCurrent='';
+const statusRu={pending:'ожидает',waiting_file_copy:'ждём окончания копирования',probing:'читаем параметры',converting:'конвертация',success:'готово',failed:'ошибка',failed_terminal:'ошибка без повтора',moved_to_failed:'в карантине',skipped:'пропущено',skip_ok:'уже готово',moved_already_hevc:'H.265 перенесён',copied_already_hevc:'H.265 скопирован',hardlinked_already_hevc:'H.265 hardlink'};
+function st(s){return statusRu[s]||s||'';} function esc(s){return String(s==null?'':s).replace(/[&<>\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]||c;});} function jsq(s){return JSON.stringify(String(s==null?'':s));}
+async function getJson(url){const r=await fetch(url);return await r.json();} async function postJson(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});return await r.json();}
+async function apiPost(url){await postJson(url,{}); refresh();} function showTab(id){['dashboard','settings','jobs','logs'].forEach(x=>document.getElementById(x).classList.toggle('hidden',x!==id)); if(id==='settings')loadSettings(); if(id==='jobs')loadJobs(); if(id==='logs')loadLogs('app');}
 function fmtPath(p){return esc(p||'');}
-async function refresh(){
- const s=await getJson('/api/stats');
- document.getElementById('progressText').textContent=s.done+' / '+s.total;
- document.getElementById('progressPercent').textContent=s.progress_percent+'%';
- document.getElementById('progressBar').style.width=s.progress_percent+'%';
- document.getElementById('savedText').textContent=s.saved_h;
- document.getElementById('savedPercent').textContent=s.saved_percent+'% · '+s.elapsed_h;
- document.getElementById('volumeText').textContent=s.source_h+' → '+s.output_h;
- document.getElementById('failedText').textContent=s.failed;
- document.getElementById('serviceText').textContent='auto: '+(s.auto_convert_enabled?'ON':'OFF')+' · worker: '+(s.worker_enabled?'ON':'OFF');
- let c=s.current;
- if(c){document.getElementById('currentBox').innerHTML='<div class="mono">'+fmtPath(c.source_path)+'</div><div>status: '+esc(c.status)+' · '+(c.progress_percent||0)+'% · fps '+esc(c.fps||'')+' · speed '+esc(c.speed||'')+'</div><div class="mono">out: '+fmtPath(c.output_path)+'</div>';document.getElementById('currentBar').style.width=(c.progress_percent||0)+'%';}
- else{document.getElementById('currentBox').textContent='IDLE';document.getElementById('currentBar').style.width='0%';}
-}
+async function refresh(){try{const s=await getJson('/api/stats');document.getElementById('progressText').textContent=s.done+' / '+s.total;document.getElementById('progressPercent').textContent=s.progress_percent+'%';document.getElementById('progressBar').style.width=s.progress_percent+'%';document.getElementById('savedText').textContent=s.saved_h;document.getElementById('savedPercent').textContent=s.saved_percent+'% · '+s.elapsed_h;document.getElementById('volumeText').textContent=s.source_h+' → '+s.output_h;document.getElementById('failedText').textContent=s.failed;document.getElementById('serviceText').textContent='авто: '+(s.auto_convert_enabled?'ВКЛ':'ВЫКЛ')+' · worker: '+(s.worker_enabled?'ВКЛ':'ВЫКЛ');let c=s.current;if(c){document.getElementById('currentBox').innerHTML='<div class="mono">'+fmtPath(c.source_path)+'</div><div>статус: '+esc(st(c.status))+' · '+(c.progress_percent||0)+'% · fps '+esc(c.fps||'')+' · скорость '+esc(c.speed||'')+'</div><div class="mono">результат: '+fmtPath(c.output_path)+'</div>';document.getElementById('currentBar').style.width=(c.progress_percent||0)+'%';}else{document.getElementById('currentBox').textContent='Ожидание';document.getElementById('currentBar').style.width='0%';}}catch(e){console.log(e)}}
 const fields=[
- ['input_path','Input path','text','span2'],['output_path','Output path','text','span2'],['failed_path','Failed path','text','span2'],['temp_path','Temp path','text','span2'],
- ['auto_convert_enabled','Auto convert','checkbox',''],['worker_enabled','Worker enabled','checkbox',''],['use_temp_path','Use temp path','checkbox',''],['preserve_input_folder','Preserve input folder name','checkbox',''],
- ['allowed_extensions','Extensions','text','span2'],['process_codecs','Process codecs','text','span2'],['hevc_action','HEVC action','select',''],['container','Container','select',''],
- ['max_width','Max width','number',''],['max_height','Max height','number',''],['crf','CRF','number',''],['preset','Preset','select',''],
- ['audio_mode','Audio mode','select',''],['audio_bitrate','Audio bitrate','text',''],['ffmpeg_threads','FFmpeg threads','number',''],['max_retries','Max retries','number',''],
- ['scan_interval_seconds','Scan sec','number',''],['stable_check_seconds','Stable check sec','number',''],['stable_check_count','Stable checks','number',''],['delete_source_after_success','Delete source after success','checkbox',''],
- ['auto_safe_retry','Auto safe retry','checkbox',''],['safe_remux_to_mp4','Safe remux to MP4','checkbox',''],['allow_mkv_fallback','Allow MKV fallback','checkbox',''],['extra_ffmpeg_args','Extra FFmpeg args','text','span2']
+ ['input_path','Входящий файл или папка','path-file','span2'],['output_path','Выходная папка','path-dir','span2'],['use_temp_path','Использовать отдельную папку временных файлов','checkbox',''],['temp_path','Папка временных файлов','path-dir','span2'],['use_failed_path','Использовать папку карантина для ошибок','checkbox',''],['failed_path','Папка карантина / failed','path-dir','span2'],
+ ['auto_convert_enabled','Автоконвертация включена','checkbox',''],['worker_enabled','Фоновый обработчик включён','checkbox',''],['preserve_input_folder','Сохранять имя входной папки в результате','checkbox',''],['delete_source_after_success','Удалять исходник после успеха','checkbox',''],
+ ['allowed_extensions','Форматы файлов, через запятую','text','span2'],['process_codecs','Кодеки для перекодирования','text','span2'],['hevc_action','Что делать с уже H.265','select',''],['container','Контейнер результата','select',''],
+ ['filter_min_width','Фильтр: мин. ширина','number',''],['filter_max_width','Фильтр: макс. ширина','number',''],['filter_min_height','Фильтр: мин. высота','number',''],['filter_max_height','Фильтр: макс. высота','number',''],
+ ['min_duration_seconds','Фильтр: мин. длительность, сек','number',''],['max_duration_seconds','Фильтр: макс. длительность, сек','number',''],['min_size_mb','Фильтр: мин. размер, МБ','number',''],['max_size_mb','Фильтр: макс. размер, МБ','number',''],
+ ['include_pattern','Имя должно содержать','text','span2'],['exclude_pattern','Имя не должно содержать','text','span2'],
+ ['max_width','Макс. ширина результата','number',''],['max_height','Макс. высота результата','number',''],['scale_if_too_large','Уменьшать, если больше лимита','checkbox',''],['crf','CRF качества','number',''],['preset','Preset скорости/качества','select',''],['ffmpeg_threads','Потоки FFmpeg, 0 = авто','number',''],
+ ['audio_mode','Аудио','select',''],['audio_bitrate','Битрейт аудио','text',''],['copy_metadata','Копировать metadata','checkbox',''],['copy_chapters','Копировать chapters','checkbox',''],['faststart','MP4 faststart','checkbox',''],['max_retries','Повторов на файл','number',''],['move_failed_after_retries','После ошибок переносить/фиксировать как failed','checkbox',''],['auto_safe_retry','Авто safe retry для битых файлов','checkbox',''],['safe_remux_to_mp4','Safe retry пытаться вернуть в MP4','checkbox',''],['allow_mkv_fallback','Разрешить MKV fallback','checkbox',''],['extra_ffmpeg_args','Доп. аргументы FFmpeg','text','span4']
 ];
-function inputHtml(k,label,type,cls){let v=settingsCache[k];let div='<div class="'+(cls||'')+'"><label>'+label+'</label>'; if(type==='checkbox'){div+='<select id="set_'+k+'"><option value="true">true</option><option value="false">false</option></select>';}else if(type==='select'){let opts=[]; if(k==='hevc_action')opts=['move','copy','hardlink','skip']; else if(k==='container')opts=['mp4','mkv']; else if(k==='preset')opts=['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow']; else if(k==='audio_mode')opts=['aac','copy','none']; div+='<select id="set_'+k+'">'+opts.map(o=>'<option>'+o+'</option>').join('')+'</select>';}else{div+='<input id="set_'+k+'" type="'+type+'">';} div+='</div>'; return div;}
-async function loadSettings(){settingsCache=await getJson('/api/settings');document.getElementById('settingsForm').innerHTML=fields.map(f=>inputHtml(f[0],f[1],f[2],f[3])).join('');fields.forEach(f=>{let el=document.getElementById('set_'+f[0]); if(el){el.value=String(settingsCache[f[0]]);}});}
-async function saveSettings(){let obj={};fields.forEach(f=>{let el=document.getElementById('set_'+f[0]); if(!el)return; let val=el.value; if(f[2]==='number')val=Number(val); if(f[2]==='checkbox')val=(val==='true'); obj[f[0]]=val;});await postJson('/api/settings',obj);await loadSettings();alert('saved');}
-async function loadJobs(){let st=document.getElementById('jobStatus').value;let data=await getJson('/api/jobs?limit=500'+(st?'&status='+encodeURIComponent(st):''));document.getElementById('jobsBody').innerHTML=data.jobs.map(j=>'<tr><td><span class="pill">'+esc(j.status)+'</span></td><td>'+esc(j.progress_percent||0)+'%</td><td class="path mono">'+fmtPath(j.source_path)+'</td><td class="path mono">'+fmtPath(j.output_path)+'</td><td>'+esc(j.source_size_h)+' → '+esc(j.output_size_h)+'</td><td class="path">'+esc(j.error_message||'')+'</td><td><button class="btn" onclick="retryJob(\''+j.id+'\')">retry</button> <button class="btn yellow" onclick="moveFailed(\''+j.id+'\')">failed</button></td></tr>').join('');}
-async function retryJob(id){await postJson('/api/jobs/'+id+'/retry',{});loadJobs();}
-async function moveFailed(id){await postJson('/api/jobs/'+id+'/move-to-failed',{});loadJobs();}
-async function loadLogs(kind){let d=await getJson('/api/logs?kind='+kind+'&lines=300');document.getElementById('logBox').textContent=d.text||'';}
+function inputHtml(k,label,type,cls){let disabled=(k==='temp_path'&&!settingsCache.use_temp_path)||(k==='failed_path'&&!settingsCache.use_failed_path);let div='<div class="'+(cls||'')+'"><label>'+label+'</label>'; if(type==='checkbox'){div+='<select id="set_'+k+'" onchange="syncDisabled()"><option value="true">да</option><option value="false">нет</option></select>';}else if(type==='select'){let opts=[]; if(k==='hevc_action')opts=['move','copy','hardlink','skip']; else if(k==='container')opts=['mp4','mkv']; else if(k==='preset')opts=['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow']; else if(k==='audio_mode')opts=['aac','copy','none']; div+='<select id="set_'+k+'" '+(disabled?'disabled':'')+'>'+opts.map(o=>'<option>'+o+'</option>').join('')+'</select>';}else if(type==='path-dir'||type==='path-file'){div+='<div class="row"><input class="mono" id="set_'+k+'" type="text" '+(disabled?'disabled':'')+'><button class="btn" type="button" '+(disabled?'disabled':'')+' onclick="openBrowser(\''+k+'\',\''+(type==='path-file'?'file':'dir')+'\')">Обзор</button></div>';}else{div+='<input id="set_'+k+'" type="'+type+'" '+(disabled?'disabled':'')+'>';} div+='</div>'; return div;}
+async function loadSettings(){settingsCache=await getJson('/api/settings');renderSettings();}
+function renderSettings(){document.getElementById('settingsForm').innerHTML=fields.map(f=>inputHtml(f[0],f[1],f[2],f[3])).join('');fields.forEach(f=>{let el=document.getElementById('set_'+f[0]); if(el){el.value=String(settingsCache[f[0]]??'');}});syncDisabled();}
+function collectSettings(){let obj={};fields.forEach(f=>{let el=document.getElementById('set_'+f[0]); if(!el)return;let val=el.value;if(f[2]==='number')val=Number(val);if(f[2]==='checkbox')val=(val==='true');obj[f[0]]=val;});return obj;}
+function syncDisabled(){let temp=document.getElementById('set_use_temp_path')?.value==='true';let fail=document.getElementById('set_use_failed_path')?.value==='true';['set_temp_path'].forEach(id=>{let el=document.getElementById(id); if(el)el.disabled=!temp;});['set_failed_path'].forEach(id=>{let el=document.getElementById(id); if(el)el.disabled=!fail;});}
+async function saveSettings(){let obj=collectSettings();await postJson('/api/settings',obj);await loadSettings();alert('Настройки сохранены');}
+function clearPaths(){['input_path','output_path','temp_path','failed_path'].forEach(k=>{let el=document.getElementById('set_'+k); if(el)el.value='';});}
+async function previewFilters(){let obj=collectSettings();let d=await postJson('/api/preview',obj);let text=''; if(!d.ok){text='Ошибка: '+d.error;}else{text+='Найдено подходящих файлов: '+d.matched+'\nПросканировано: '+d.scanned+'\nНе подошло: '+d.skipped+'\nОбщий размер подходящих: '+d.source_h+'\n'; if(d.warnings?.length)text+='\nПредупреждения:\n- '+d.warnings.join('\n- ')+'\n'; if(d.samples?.length){text+='\nПримеры:\n';d.samples.forEach(x=>{text+='- '+x.size_h+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path+'\n';});}} document.getElementById('previewBox').textContent=text;}
+async function loadJobs(){let stv=document.getElementById('jobStatus').value;let data=await getJson('/api/jobs?limit=500'+(stv?'&status='+encodeURIComponent(stv):''));document.getElementById('jobsBody').innerHTML=data.jobs.map(j=>'<tr><td><span class="pill">'+esc(st(j.status))+'</span></td><td>'+esc(j.progress_percent||0)+'%</td><td class="path mono">'+fmtPath(j.source_path)+'</td><td class="path mono">'+fmtPath(j.output_path)+'</td><td>'+esc(j.source_size_h)+' → '+esc(j.output_size_h)+'</td><td class="path">'+esc(j.error_message||'')+'</td><td><button class="btn" onclick="retryJob(\''+j.id+'\')">повторить</button> <button class="btn yellow" onclick="moveFailed(\''+j.id+'\')">в failed</button></td></tr>').join('');}
+async function retryJob(id){await postJson('/api/jobs/'+id+'/retry',{});loadJobs();} async function moveFailed(id){await postJson('/api/jobs/'+id+'/move-to-failed',{});loadJobs();} async function loadLogs(kind){let d=await getJson('/api/logs?kind='+kind+'&lines=300');document.getElementById('logBox').textContent=d.text||'';}
+function openBrowser(target,mode){browserTarget=target;browserMode=mode;document.getElementById('browserModal').classList.add('show');browseTo(document.getElementById('set_'+target)?.value||'');}
+function closeBrowser(){document.getElementById('browserModal').classList.remove('show');}
+async function browseTo(path){let d=await getJson('/api/fs?path='+encodeURIComponent(path||''));browserCurrent=d.path||'';document.getElementById('browserPath').value=browserCurrent;let html=''; if(d.parent){html+='<div class="fileitem" onclick="browseTo('+esc(jsq(d.parent))+')"><div>⬆️</div><div>..</div><div></div><div></div></div>';} if(d.error){html+='<div class="fileitem"><div>⚠️</div><div>'+esc(d.error)+'</div><div></div><div></div></div>';} (d.entries||[]).forEach(e=>{let icon=e.is_dir?'📁':'🎞️';let click=e.is_dir?'browseTo('+esc(jsq(e.path))+')':'selectFile('+esc(jsq(e.path))+')';html+='<div class="fileitem" onclick="'+click+'"><div>'+icon+'</div><div class="mono">'+esc(e.name)+'</div><div class="muted">'+esc(e.type)+'</div><div class="muted">'+esc(e.size_h||'')+'</div></div>';});document.getElementById('browserList').innerHTML=html||'<div class="fileitem"><div></div><div>Пусто</div><div></div><div></div></div>';}
+function selectFile(path){if(browserMode==='file'){document.getElementById('set_'+browserTarget).value=path;closeBrowser();}else{browseTo(path);}} function selectCurrentFolder(){if(browserTarget){document.getElementById('set_'+browserTarget).value=browserCurrent;closeBrowser();}}
 setInterval(refresh,2000); refresh();
 </script>
 </body>
 </html>
 """
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "AutoH265/" + APP_VERSION
     def log_message(self, fmt, *args):
@@ -929,6 +1080,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stats":
             self.send_json(stats_payload())
             return
+        if path == "/api/fs":
+            self.send_json(list_path(qs.get("path", [""])[0]))
+            return
         if path == "/api/jobs":
             limit = int(qs.get("limit", [300])[0] or 300)
             status = qs.get("status", [""])[0] or None
@@ -958,6 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self.read_json()
         if path == "/api/settings":
             self.send_json(save_settings(body))
+            return
+        if path == "/api/preview":
+            self.send_json(preview_payload(body))
             return
         if path == "/api/scan":
             n = scan_files()

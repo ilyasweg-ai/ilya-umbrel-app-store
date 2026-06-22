@@ -1,21 +1,23 @@
-# Auto H265 Converter for Umbrel
+# Auto H265 Converter
 
-MVP web app for automatic FFmpeg conversion.
+Web-приложение для Umbrel OS: автоматическая конвертация видео через FFmpeg.
 
-Default container paths:
+## Версия 0.2.0
 
-- Input: `/media/ssd990_main/porn`
-- Output: `/media/ssd990_main/new`
-- Failed: `/media/ssd990_main/failed_convert`
+Что есть:
 
-On Umbrel host these map to `${UMBREL_ROOT}/external/...`, for example `/home/umbrel/umbrel/external/ssd990_main/porn`.
+- русский интерфейс;
+- выбор входящего файла или папки через UI;
+- выбор выходной папки через UI;
+- доступ к `/media` для внешних дисков Umbrel;
+- доступ к `/host` для всей файловой системы хоста;
+- пустые пути по умолчанию, ничего случайно не запускается;
+- предпросмотр фильтров: сколько файлов подходит и какой общий размер;
+- фильтры по расширениям, кодекам, длительности, размеру и разрешению;
+- опциональная папка временных файлов;
+- опциональная папка карантина failed;
+- H.264 → H.265 через libx265;
+- live progress, очередь, статистика экономии;
+- safe retry для проблемных файлов.
 
-Features:
-
-- H.264 to H.265/HEVC using FFmpeg/libx265.
-- Max resolution limit, default 4096x2048.
-- Live current-file progress.
-- Queue and statistics.
-- Safe retry for broken files.
-- Failed quarantine to avoid infinite retry loops.
-- UI settings for paths, filters, codec, CRF, preset, audio mode, temp path, retries.
+Внешний порт приложения: `8795`. Внутренний порт server-контейнера: `8080`. Хостовый порт 8080 не используется приложением.
