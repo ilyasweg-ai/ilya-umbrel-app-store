@@ -13,7 +13,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "app.sqlite")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -81,7 +81,7 @@ DEFAULT_SETTINGS = {
     "filter_min_height": 0,
     "filter_max_height": 0,
     "process_codecs": "h264,mpeg4,vp9,av1,unknown",
-    "hevc_action": "move",  # skip, move, copy, hardlink
+    "hevc_action": "skip",  # skip, move, copy, hardlink
     "max_width": 4096,
     "max_height": 2048,
     "scale_if_too_large": True,
@@ -1300,7 +1300,7 @@ INDEX_HTML = r"""
 <section id="settings" class="hidden">
   <div class="card"><h2>Быстрые пресеты</h2><div class="hint">Пресет просто заполняет настройки. Потом можно руками поменять любой параметр.</div><div class="row" style="margin-top:12px" id="presetButtons"></div></div>
   <div class="card section"><h2>1. Что обрабатывать и куда складывать</h2><div class="formgrid" id="pathForm"></div></div>
-  <div class="card section"><h2>2. Предпросмотр найденных видео</h2><div class="hint">Сначала сканируем выбранную папку/файл. Потом число “Будет обработано” пересчитывается прямо на странице при изменении форматов, кодеков, разрешений, длительности и размера. Повторно сканировать нужно только если в папке появились новые файлы.</div><div class="row" style="margin-top:12px"><button class="btn blue" onclick="previewFilters()">Проанализировать папку / файл</button><button class="btn" onclick="selectAllExt(true)">Выбрать все форматы</button><button class="btn" onclick="selectAllExt(false)">Снять все</button></div><div id="dynamicPreview" class="grid3" style="margin-top:14px"></div><div class="grid2" style="margin-top:14px"><div><div id="pie" class="pie"></div></div><div><h3>Форматы, найденные при сканировании</h3><div id="extChecks" class="checkgrid"></div><div id="previewSummary" class="log mono" style="margin-top:12px;max-height:220px">Нажми “Проанализировать”.</div></div></div></div>
+  <div class="card section"><h2>2. Предпросмотр найденных видео</h2><div class="hint">Сначала сканируем выбранную папку/файл. Потом приложение отдельно показывает: что реально будет перекодировано, что уже готово H.265 и что будет только перенесено/скопировано без конвертации. Повторно сканировать нужно только если в папке появились новые файлы.</div><div class="row" style="margin-top:12px"><button class="btn blue" onclick="previewFilters()">Проанализировать папку / файл</button><button class="btn" onclick="selectAllExt(true)">Выбрать все форматы</button><button class="btn" onclick="selectAllExt(false)">Снять все</button></div><div id="dynamicPreview" class="grid3" style="margin-top:14px"></div><div class="grid2" style="margin-top:14px"><div><div id="pie" class="pie"></div></div><div><h3>Форматы, найденные при сканировании</h3><div id="extChecks" class="checkgrid"></div><div id="previewSummary" class="log mono" style="margin-top:12px;max-height:220px">Нажми “Проанализировать”.</div></div></div></div>
   <div class="card section"><h2>3. Простые настройки конвертации</h2><div class="formgrid" id="simpleForm"></div><div class="row" style="margin-top:12px"><button class="btn" onclick="setResolutionPreset('720p')">Выход до 720p</button><button class="btn" onclick="setResolutionPreset('1080p')">до 1080p</button><button class="btn" onclick="setResolutionPreset('2k')">до 2K</button><button class="btn" onclick="setResolutionPreset('4k')">до 4K</button><button class="btn" onclick="setResolutionPreset('4096x2048')">до 4096×2048</button></div></div>
   <div class="card section"><details class="details"><summary>Расширенные настройки FFmpeg и поведения при ошибках</summary><div class="formgrid" id="advancedForm" style="margin-top:14px"></div></details></div>
   <div class="card section"><h2>Сохранение и обслуживание</h2><div class="row"><button class="btn green" onclick="saveSettings()">Сохранить настройки</button><button class="btn" onclick="loadSettings()">Перезагрузить форму</button><button class="btn yellow" onclick="clearPaths()">Очистить пути</button><button class="btn yellow" onclick="resetSettings()">Сбросить настройки</button><button class="btn red" onclick="clearStats()">Очистить статистику/очередь</button></div><div class="small" style="margin-top:10px">Очистка статистики удаляет историю сканирования и очередь из базы приложения. Готовые видео и исходники не удаляются.</div></div>
@@ -1312,7 +1312,7 @@ INDEX_HTML = r"""
 <script>
 let settingsCache={}, browserTarget=null, browserMode='dir', browserCurrent='', previewData=null;
 const colors=['#22d3ee','#22c55e','#f59e0b','#ef4444','#60a5fa','#a78bfa','#f472b6','#fb923c','#84cc16','#14b8a6','#e879f9','#facc15'];
-const tips={input_path:'Файл или папка, откуда приложение будет брать видео. Можно выбрать /media для внешних дисков Umbrel или /host для всей системы.',output_path:'Папка, куда складывать готовые файлы. Лучше выбирать отдельную папку, чтобы не смешивать исходники и результат.',auto_convert_enabled:'Если выключено, приложение не начнёт конвертировать автоматически. Можно только сканировать и смотреть предпросмотр.',worker_enabled:'Фоновый обработчик. Обычно должен быть включён. Если выключить, очередь не будет выполняться.',allowed_extensions:'Форматы файлов, которые будут реально взяты в очередь. Проще выбрать их галками после анализа папки.',process_codecs:'Кодеки, которые нужно перекодировать. Обычно достаточно h264,mpeg4,vp9,av1,unknown. HEVC/H.265 обрабатывается отдельным правилом.',hevc_action:'Что делать с файлами, которые уже H.265 и не требуют уменьшения: пропустить, перенести, скопировать или сделать hardlink.',max_width:'Максимальная ширина итогового видео. Если исходник меньше, он не увеличивается.',max_height:'Максимальная высота итогового видео. Если исходник меньше, он не увеличивается.',crf:'Главный параметр качества H.265. Меньше число = выше качество и больше размер. Обычно 22-26.',preset:'Скорость кодирования. Medium — нормальный баланс. Slow может жать лучше, но медленнее.',audio_mode:'Что делать со звуком. AAC 160k — самый совместимый вариант для MP4.',audio_bitrate:'Битрейт звука при AAC. Обычно 128k-192k достаточно.',delete_source_after_success:'Опасная настройка: удалять исходник после успешной конвертации. Лучше держать выключенной.',use_failed_path:'Если включено, битые файлы после ошибок будут уходить в карантин.',failed_path:'Папка карантина для файлов, которые не удалось обработать.',use_temp_path:'Обычно не нужно. Если выключено, временный файл создаётся рядом с итоговым и потом переименовывается.',temp_path:'Отдельная временная папка. Нужна редко: например, если хочешь писать временные файлы на другой диск.',filter_min_width:'Фильтр по исходному видео. 0 = не учитывать.',filter_max_width:'Фильтр по исходному видео. 0 = не учитывать.',filter_min_height:'Фильтр по исходному видео. 0 = не учитывать.',filter_max_height:'Фильтр по исходному видео. 0 = не учитывать.',min_duration_seconds:'Минимальная длительность исходника. 0 = не учитывать.',max_duration_seconds:'Максимальная длительность исходника. 0 = не учитывать.',min_size_mb:'Минимальный размер файла. 0 = не учитывать.',max_size_mb:'Максимальный размер файла. 0 = не учитывать.',include_pattern:'Брать только файлы, в пути которых есть этот текст. Пусто = не использовать.',exclude_pattern:'Не брать файлы, в пути которых есть этот текст. Пусто = не использовать.',ffmpeg_threads:'Количество потоков FFmpeg. 0 = автоматически. Можно ограничить, чтобы меньше грузить CPU.',max_retries:'Сколько раз пробовать файл после ошибки. Обычно 1, чтобы не было бесконечной долбёжки.',auto_safe_retry:'Если обычный MP4 падает, попробовать безопасный режим для битых таймкодов/аудио.',safe_remux_to_mp4:'После безопасного MKV попробовать переложить результат обратно в MP4.',allow_mkv_fallback:'Если MP4 не получается, разрешить оставить MKV. Выключи, если Umbrel плохо показывает MKV.',extra_ffmpeg_args:'Дополнительные аргументы FFmpeg. Лучше не трогать, если не понимаешь.'};
+const tips={input_path:'Файл или папка, откуда приложение будет брать видео. Можно выбрать /media для внешних дисков Umbrel или /host для всей системы.',output_path:'Папка, куда складывать готовые файлы. Лучше выбирать отдельную папку, чтобы не смешивать исходники и результат.',auto_convert_enabled:'Если выключено, приложение не начнёт конвертировать автоматически. Можно только сканировать и смотреть предпросмотр.',worker_enabled:'Фоновый обработчик. Обычно должен быть включён. Если выключить, очередь не будет выполняться.',allowed_extensions:'Форматы файлов, которые будут реально взяты в очередь. Проще выбрать их галками после анализа папки.',process_codecs:'Именно эти кодеки будут заново перекодированы в H.265. Обычно: h264,mpeg4,vp9,av1,unknown. НЕ добавляй сюда hevc/h265, если не хочешь повторно жать уже готовые H.265. Для HEVC есть отдельная настройка ниже.',hevc_action:'Что делать с уже готовыми H.265/HEVC, если они не больше лимита разрешения. Пропускать = вообще не трогать. Переносить/копировать/hardlink = действие без перекодирования. Если HEVC больше лимита и включено уменьшение, он будет перекодирован только для уменьшения.',max_width:'Максимальная ширина итогового видео. Если исходник меньше, он не увеличивается.',max_height:'Максимальная высота итогового видео. Если исходник меньше, он не увеличивается.',crf:'Главный параметр качества H.265. Меньше число = выше качество и больше размер. Обычно 22-26.',preset:'Скорость кодирования. Medium — нормальный баланс. Slow может жать лучше, но медленнее.',audio_mode:'Что делать со звуком. AAC 160k — самый совместимый вариант для MP4.',audio_bitrate:'Битрейт звука при AAC. Обычно 128k-192k достаточно.',delete_source_after_success:'Опасная настройка: удалять исходник после успешной конвертации. Лучше держать выключенной.',use_failed_path:'Если включено, битые файлы после ошибок будут уходить в карантин.',failed_path:'Папка карантина для файлов, которые не удалось обработать.',use_temp_path:'Обычно не нужно. Если выключено, временный файл создаётся рядом с итоговым и потом переименовывается.',temp_path:'Отдельная временная папка. Нужна редко: например, если хочешь писать временные файлы на другой диск.',filter_min_width:'Фильтр по исходному видео. 0 = не учитывать.',filter_max_width:'Фильтр по исходному видео. 0 = не учитывать.',filter_min_height:'Фильтр по исходному видео. 0 = не учитывать.',filter_max_height:'Фильтр по исходному видео. 0 = не учитывать.',min_duration_seconds:'Минимальная длительность исходника. 0 = не учитывать.',max_duration_seconds:'Максимальная длительность исходника. 0 = не учитывать.',min_size_mb:'Минимальный размер файла. 0 = не учитывать.',max_size_mb:'Максимальный размер файла. 0 = не учитывать.',include_pattern:'Брать только файлы, в пути которых есть этот текст. Пусто = не использовать.',exclude_pattern:'Не брать файлы, в пути которых есть этот текст. Пусто = не использовать.',ffmpeg_threads:'Количество потоков FFmpeg. 0 = автоматически. Можно ограничить, чтобы меньше грузить CPU.',max_retries:'Сколько раз пробовать файл после ошибки. Обычно 1, чтобы не было бесконечной долбёжки.',auto_safe_retry:'Если обычный MP4 падает, попробовать безопасный режим для битых таймкодов/аудио.',safe_remux_to_mp4:'После безопасного MKV попробовать переложить результат обратно в MP4.',allow_mkv_fallback:'Если MP4 не получается, разрешить оставить MKV. Выключи, если Umbrel плохо показывает MKV.',extra_ffmpeg_args:'Дополнительные аргументы FFmpeg. Лучше не трогать, если не понимаешь.'};
 const statusRu={pending:'ожидает',waiting_file_copy:'ждём окончания копирования',probing:'читаем параметры',converting:'конвертация',success:'готово',failed:'ошибка',failed_terminal:'ошибка без повтора',moved_to_failed:'в карантине',skipped:'пропущено',skip_ok:'уже готово',moved_already_hevc:'H.265 перенесён',copied_already_hevc:'H.265 скопирован',hardlinked_already_hevc:'H.265 hardlink'};
 function st(s){return statusRu[s]||s||''} function esc(s){return String(s==null?'':s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]||c))} function jsq(s){return JSON.stringify(String(s==null?'':s))} function fmtPath(p){return esc(p||'')}
 async function getJson(u){let r=await fetch(u);return await r.json()} async function postJson(u,d){let r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return await r.json()} async function apiPost(u){await postJson(u,{});await refresh()}
@@ -1320,10 +1320,10 @@ function showTab(id){['dashboard','settings','jobs','logs'].forEach(x=>document.
 async function refresh(){try{const s=await getJson('/api/stats');document.getElementById('progressText').textContent=s.done+' / '+s.total;document.getElementById('progressPercent').textContent=s.progress_percent+'%';document.getElementById('progressBar').style.width=s.progress_percent+'%';document.getElementById('savedText').textContent=s.saved_h;document.getElementById('savedPercent').textContent=s.saved_percent+'% · '+s.elapsed_h;document.getElementById('volumeText').textContent=s.source_h+' → '+s.output_h;document.getElementById('failedText').textContent=s.failed;document.getElementById('serviceText').textContent='авто: '+(s.auto_convert_enabled?'ВКЛ':'ВЫКЛ')+' · worker: '+(s.worker_enabled?'ВКЛ':'ВЫКЛ');let c=s.current;if(c){document.getElementById('currentBox').innerHTML='<div class="mono">'+fmtPath(c.source_path)+'</div><div>статус: '+esc(st(c.status))+' · '+(c.progress_percent||0)+'% · fps '+esc(c.fps||'')+' · скорость '+esc(c.speed||'')+'</div><div class="mono">результат: '+fmtPath(c.output_path)+'</div>';document.getElementById('currentBar').style.width=(c.progress_percent||0)+'%'}else{document.getElementById('currentBox').textContent='Ожидание';document.getElementById('currentBar').style.width='0%'}}catch(e){console.log(e)}}
 const fields={
 path:[['input_path','Входящий файл или папка','path-file','span2'],['output_path','Выходная папка','path-dir','span2'],['auto_convert_enabled','Автоконвертация','checkbox',''],['worker_enabled','Фоновый обработчик','checkbox',''],['preserve_input_folder','Сохранять имя входной папки в результате','checkbox',''],['delete_source_after_success','Удалять исходник после успеха','checkbox','']],
-simple:[['allowed_extensions','Форматы для обработки','text','span2'],['process_codecs','Кодеки для перекодирования','text','span2'],['hevc_action','Уже H.265','select',''],['container','Контейнер результата','select',''],['max_width','Макс. ширина результата','number',''],['max_height','Макс. высота результата','number',''],['scale_if_too_large','Уменьшать, если больше лимита','checkbox',''],['crf','CRF качества','number',''],['preset','Preset скорости/качества','select',''],['audio_mode','Аудио','select',''],['audio_bitrate','Битрейт аудио','text',''],['allow_mkv_fallback','Разрешить MKV fallback','checkbox','']],
+simple:[['allowed_extensions','Форматы для обработки','text','span2'],['process_codecs','Кодеки, которые перекодировать заново','text','span2'],['hevc_action','Уже готовые H.265 / HEVC','select',''],['container','Контейнер результата','select',''],['max_width','Макс. ширина результата','number',''],['max_height','Макс. высота результата','number',''],['scale_if_too_large','Уменьшать, если больше лимита','checkbox',''],['crf','CRF качества','number',''],['preset','Preset скорости/качества','select',''],['audio_mode','Аудио','select',''],['audio_bitrate','Битрейт аудио','text',''],['allow_mkv_fallback','Разрешить MKV fallback','checkbox','']],
 advanced:[['filter_min_width','Фильтр: мин. ширина','number',''],['filter_max_width','Фильтр: макс. ширина','number',''],['filter_min_height','Фильтр: мин. высота','number',''],['filter_max_height','Фильтр: макс. высота','number',''],['min_duration_seconds','Фильтр: мин. длительность, сек','number',''],['max_duration_seconds','Фильтр: макс. длительность, сек','number',''],['min_size_mb','Фильтр: мин. размер, МБ','number',''],['max_size_mb','Фильтр: макс. размер, МБ','number',''],['include_pattern','Имя должно содержать','text','span2'],['exclude_pattern','Имя не должно содержать','text','span2'],['use_temp_path','Отдельная временная папка','checkbox',''],['temp_path','Папка временных файлов','path-dir','span2'],['use_failed_path','Использовать карантин','checkbox',''],['failed_path','Папка карантина','path-dir','span2'],['copy_metadata','Копировать metadata','checkbox',''],['copy_chapters','Копировать chapters','checkbox',''],['faststart','MP4 faststart','checkbox',''],['ffmpeg_threads','Потоки FFmpeg','number',''],['max_retries','Повторов на файл','number',''],['move_failed_after_retries','После ошибок фиксировать как failed','checkbox',''],['auto_safe_retry','Авто safe retry','checkbox',''],['safe_remux_to_mp4','Safe retry вернуть в MP4','checkbox',''],['extra_ffmpeg_args','Доп. аргументы FFmpeg','text','span4']]
 };
-const selectOptions={hevc_action:[['skip','пропускать'],['move','переносить'],['copy','копировать'],['hardlink','hardlink']],container:[['mp4','mp4'],['mkv','mkv']],preset:['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'].map(x=>[x,x]),audio_mode:[['aac','AAC 160k'],['copy','копировать'],['none','без звука']]};
+const selectOptions={hevc_action:[['skip','не трогать / пропускать'],['move','перенести без конвертации'],['copy','скопировать без конвертации'],['hardlink','hardlink без конвертации']],container:[['mp4','mp4'],['mkv','mkv']],preset:['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'].map(x=>[x,x]),audio_mode:[['aac','AAC 160k'],['copy','копировать'],['none','без звука']]};
 function fieldList(){return [...fields.path,...fields.simple,...fields.advanced]}
 function settingsChanged(){updateDynamicPreview()}
 function label(k,txt){return '<label>'+esc(txt)+' <span class="q" data-tip="'+esc(tips[k]||'Подсказка')+'">?</span></label>'}
@@ -1332,7 +1332,7 @@ function renderSettings(){document.getElementById('pathForm').innerHTML=fields.p
 async function loadSettings(){settingsCache=await getJson('/api/settings');renderSettings()}
 function collectSettings(){let obj={};fieldList().forEach(f=>{let el=document.getElementById('set_'+f[0]); if(!el)return;let val=el.value;if(f[2]==='number')val=Number(val);if(f[2]==='checkbox')val=(val==='true');obj[f[0]]=val});return obj}
 function syncDisabled(){let temp=document.getElementById('set_use_temp_path')?.value==='true';let fail=document.getElementById('set_use_failed_path')?.value==='true';let tp=document.getElementById('set_temp_path');if(tp)tp.disabled=!temp;let fp=document.getElementById('set_failed_path');if(fp)fp.disabled=!fail}
-function renderPresets(){const p=[['balanced','Баланс','H.265 CRF 24, medium, до 4096×2048'],['quality','Качество','CRF 22, slow, больше размер'],['small','Сжать сильнее','CRF 26, medium, меньше размер'],['compat','Совместимый MP4','MP4 + AAC + safe remux'],['nohevc','Не трогать H.265','готовые HEVC пропускать']];document.getElementById('presetButtons').innerHTML=p.map(x=>'<button class="btn preset" onclick="applyPreset(\''+x[0]+'\')"><b>'+x[1]+'</b><span>'+x[2]+'</span></button>').join('')}
+function renderPresets(){const p=[['balanced','Баланс','H.265 CRF 24, medium, до 4096×2048'],['quality','Качество','CRF 22, slow, больше размер'],['small','Сжать сильнее','CRF 26, medium, меньше размер'],['compat','Совместимый MP4','MP4 + AAC + safe remux'],['nohevc','Не трогать готовые H.265','уже готовые HEVC пропускать']];document.getElementById('presetButtons').innerHTML=p.map(x=>'<button class="btn preset" onclick="applyPreset(\''+x[0]+'\')"><b>'+x[1]+'</b><span>'+x[2]+'</span></button>').join('')}
 function setVal(k,v){let el=document.getElementById('set_'+k); if(el)el.value=String(v);updateDynamicPreview()}
 function applyPreset(id){if(id==='balanced'){setVal('video_encoder','libx265');setVal('crf',24);setVal('preset','medium');setVal('container','mp4');setVal('audio_mode','aac');setVal('audio_bitrate','160k');setVal('max_width',4096);setVal('max_height',2048);setVal('scale_if_too_large',true);setVal('auto_safe_retry',true);setVal('safe_remux_to_mp4',true);setVal('allow_mkv_fallback',false)} if(id==='quality'){setVal('crf',22);setVal('preset','slow');setVal('audio_bitrate','192k')} if(id==='small'){setVal('crf',26);setVal('preset','medium');setVal('audio_bitrate','128k')} if(id==='compat'){setVal('container','mp4');setVal('audio_mode','aac');setVal('safe_remux_to_mp4',true);setVal('allow_mkv_fallback',false)} if(id==='nohevc'){setVal('hevc_action','skip')} }
 function setResolutionPreset(id){let map={"720p":[1280,720],"1080p":[1920,1080],"2k":[2560,1440],"4k":[3840,2160],"4096x2048":[4096,2048]};let m=map[id];if(m){setVal('max_width',m[0]);setVal('max_height',m[1]);setVal('scale_if_too_large',true)}}
@@ -1346,45 +1346,125 @@ function parseList(v){return String(v||'').split(',').map(x=>x.trim().toLowerCas
 function humanBytes(n){n=Number(n||0);let u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return i===0?Math.round(n)+u[i]:n.toFixed(1)+u[i]}
 function drawPie(stats){let total=stats.reduce((a,x)=>a+x.count,0);let acc=0;let parts=[];stats.forEach((x,i)=>{let a=acc/total*100;acc+=x.count;let b=acc/total*100;parts.push(colors[i%colors.length]+' '+a+'% '+b+'%')});document.getElementById('pie').style.background=total?'conic-gradient('+parts.join(',')+')':'#102126'}
 function renderExtChecks(stats){let allowed=(document.getElementById('set_allowed_extensions')?.value||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);let all=!allowed.length;document.getElementById('extChecks').innerHTML=stats.map((x,i)=>'<label class="check"><input class="extBox" type="checkbox" value="'+esc(x.name)+'" '+(all||allowed.includes(x.name)?'checked':'')+' onchange="applyExtSelection()"><span class="sw" style="background:'+colors[i%colors.length]+'"></span><span>.'+esc(x.name)+' · '+x.count+' шт · '+esc(x.bytes_h)+'</span></label>').join('')}
-function localPasses(file, settings){
-  if(!file || !file.probe_ok)return false;
-  let allowed=parseList(settings.allowed_extensions); if(allowed.length && !allowed.includes(String(file.ext||'').toLowerCase()))return false;
-  let codec=String(file.codec||'unknown').toLowerCase();
+function baseFilterPasses(file, settings){
+  if(!file || !file.probe_ok)return {ok:false, reason:'не удалось прочитать видео'};
+  let allowed=parseList(settings.allowed_extensions);
+  if(allowed.length && !allowed.includes(String(file.ext||'').toLowerCase()))return {ok:false, reason:'формат не выбран'};
   let width=Number(file.width||0), height=Number(file.height||0), dur=Number(file.duration||0), size=Number(file.size||0);
   let minD=Number(settings.min_duration_seconds||0), maxD=Number(settings.max_duration_seconds||0);
   let minMB=Number(settings.min_size_mb||0), maxMB=Number(settings.max_size_mb||0);
   let minW=Number(settings.filter_min_width||0), maxW=Number(settings.filter_max_width||0);
   let minH=Number(settings.filter_min_height||0), maxH=Number(settings.filter_max_height||0);
-  if(minD && dur < minD)return false; if(maxD && dur > maxD)return false;
-  if(minMB && size < minMB*1048576)return false; if(maxMB && size > maxMB*1048576)return false;
-  if(minW && width < minW)return false; if(maxW && width > maxW)return false;
-  if(minH && height < minH)return false; if(maxH && height > maxH)return false;
-  let inc=String(settings.include_pattern||'').toLowerCase().trim(); let exc=String(settings.exclude_pattern||'').toLowerCase().trim(); let path=String(file.path||'').toLowerCase();
-  if(inc && !path.includes(inc))return false; if(exc && path.includes(exc))return false;
-  if(codec==='hevc'){
-    let tooLarge=width>Number(settings.max_width||4096)||height>Number(settings.max_height||2048);
-    return tooLarge || String(settings.hevc_action||'move')!=='skip';
-  }
-  let pc=parseList(settings.process_codecs); return pc.includes(codec) || (codec==='unknown' && pc.includes('unknown'));
+  if(minD && dur < minD)return {ok:false, reason:'меньше минимальной длительности'};
+  if(maxD && dur > maxD)return {ok:false, reason:'больше максимальной длительности'};
+  if(minMB && size < minMB*1048576)return {ok:false, reason:'меньше минимального размера'};
+  if(maxMB && size > maxMB*1048576)return {ok:false, reason:'больше максимального размера'};
+  if(minW && width < minW)return {ok:false, reason:'ширина меньше фильтра'};
+  if(maxW && width > maxW)return {ok:false, reason:'ширина больше фильтра'};
+  if(minH && height < minH)return {ok:false, reason:'высота меньше фильтра'};
+  if(maxH && height > maxH)return {ok:false, reason:'высота больше фильтра'};
+  let inc=String(settings.include_pattern||'').toLowerCase().trim();
+  let exc=String(settings.exclude_pattern||'').toLowerCase().trim();
+  let path=String(file.path||'').toLowerCase();
+  if(inc && !path.includes(inc))return {ok:false, reason:'путь не содержит нужный текст'};
+  if(exc && path.includes(exc))return {ok:false, reason:'путь содержит исключённый текст'};
+  return {ok:true, reason:''};
 }
-function buildLocalStats(files, settings){let matched=[], skipped=0, bytes=0, extMap={};for(let f of (files||[])){let ok=localPasses(f,settings);if(ok){matched.push(f);bytes+=Number(f.size||0);extMap[f.ext]=(extMap[f.ext]||0)+1}else skipped++}return {matched,skipped,bytes,extMap}}
+function classifyFileAction(file, settings){
+  let base=baseFilterPasses(file, settings);
+  if(!base.ok)return {kind:'filtered', active:false, label:'не попадёт в работу', reason:base.reason};
+  let codec=String(file.codec||'unknown').toLowerCase();
+  let width=Number(file.width||0), height=Number(file.height||0);
+  let maxW=Number(settings.max_width||4096), maxH=Number(settings.max_height||2048);
+  let tooLarge=(width>maxW || height>maxH);
+  let scale=String(settings.scale_if_too_large)==='true' || settings.scale_if_too_large===true;
+  if(codec==='hevc'){
+    if(tooLarge && scale){
+      return {kind:'reencode', active:true, label:'перекодировать: HEVC больше лимита', reason:'уже H.265, но больше заданного лимита разрешения'};
+    }
+    let action=String(settings.hevc_action||'skip');
+    if(action==='skip')return {kind:'ready', active:false, label:'уже готов H.265 — пропустить', reason:'конвертация не нужна'};
+    if(action==='move')return {kind:'move', active:true, label:'перенести без конвертации', reason:'уже H.265'};
+    if(action==='copy')return {kind:'copy', active:true, label:'скопировать без конвертации', reason:'уже H.265'};
+    if(action==='hardlink')return {kind:'hardlink', active:true, label:'hardlink без конвертации', reason:'уже H.265'};
+    return {kind:'ready', active:false, label:'уже готов H.265 — пропустить', reason:'конвертация не нужна'};
+  }
+  let pc=parseList(settings.process_codecs);
+  if(pc.includes(codec) || (codec==='unknown' && pc.includes('unknown'))){
+    return {kind:'reencode', active:true, label:'перекодировать в H.265', reason:'кодек выбран для перекодирования'};
+  }
+  return {kind:'filtered', active:false, label:'не попадёт в работу', reason:'кодек не выбран для перекодирования'};
+}
+function localPasses(file, settings){let a=classifyFileAction(file,settings);return a.active}
+function buildLocalStats(files, settings){
+  let stats={total:(files||[]).length,reencode:0,reencodeBytes:0,ready:0,readyBytes:0,move:0,moveBytes:0,copy:0,copyBytes:0,hardlink:0,hardlinkBytes:0,filtered:0,filteredBytes:0,active:0,activeBytes:0,extMap:{},actionMap:{},samplesByAction:{reencode:[],move:[],copy:[],hardlink:[],ready:[],filtered:[]}};
+  for(let f of (files||[])){
+    let a=classifyFileAction(f,settings);let size=Number(f.size||0);let ext=String(f.ext||'unknown');
+    if(a.kind==='reencode'){stats.reencode++;stats.reencodeBytes+=size;stats.active++;stats.activeBytes+=size;stats.extMap[ext]=(stats.extMap[ext]||0)+1}
+    else if(a.kind==='move'){stats.move++;stats.moveBytes+=size;stats.active++;stats.activeBytes+=size;stats.extMap[ext]=(stats.extMap[ext]||0)+1}
+    else if(a.kind==='copy'){stats.copy++;stats.copyBytes+=size;stats.active++;stats.activeBytes+=size;stats.extMap[ext]=(stats.extMap[ext]||0)+1}
+    else if(a.kind==='hardlink'){stats.hardlink++;stats.hardlinkBytes+=size;stats.active++;stats.activeBytes+=size;stats.extMap[ext]=(stats.extMap[ext]||0)+1}
+    else if(a.kind==='ready'){stats.ready++;stats.readyBytes+=size}
+    else {stats.filtered++;stats.filteredBytes+=size}
+    stats.actionMap[a.kind]=(stats.actionMap[a.kind]||0)+1;
+    if(stats.samplesByAction[a.kind] && stats.samplesByAction[a.kind].length<5){stats.samplesByAction[a.kind].push({...f, action_label:a.label, action_reason:a.reason})}
+  }
+  return stats;
+}
+function actionSummaryText(res){
+  let parts=[];
+  if(res.reencode)parts.push('перекодировать: '+res.reencode);
+  if(res.move)parts.push('перенести без конвертации: '+res.move);
+  if(res.copy)parts.push('скопировать без конвертации: '+res.copy);
+  if(res.hardlink)parts.push('hardlink без конвертации: '+res.hardlink);
+  if(res.ready)parts.push('уже готовые H.265, не трогаем: '+res.ready);
+  if(res.filtered)parts.push('не подходит под фильтры: '+res.filtered);
+  return parts.join(' · ') || 'ничего';
+}
+function sampleLines(res){
+  let lines=[];
+  let add=(title,arr)=>{if(arr&&arr.length){lines.push('\n'+title+':');arr.forEach(x=>lines.push('- '+(x.size_h||humanBytes(x.size))+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.action_label+' · '+x.path))}};
+  add('Примеры файлов, которые будут перекодированы',res.samplesByAction.reencode);
+  add('Примеры уже H.265, которые будут перенесены/скопированы/hardlink', [...res.samplesByAction.move,...res.samplesByAction.copy,...res.samplesByAction.hardlink].slice(0,5));
+  add('Примеры уже готовых H.265, которые не будут тронуты',res.samplesByAction.ready);
+  return lines.join('\n');
+}
 function updateDynamicPreview(){
   let box=document.getElementById('dynamicPreview'); if(!box)return;
   if(!previewData || !previewData.ok || !previewData.all_files){box.innerHTML='';return;}
   let st=collectSettings(); let files=previewData.all_files||[]; let res=buildLocalStats(files,st);
-  let total=files.length; let match=res.matched.length; let skipped=res.skipped;
-  let textExt=Object.entries(res.extMap).sort((a,b)=>b[1]-a[1]).map(x=>'.'+x[0]+': '+x[1]).join(' · ') || 'ничего не выбрано';
-  box.innerHTML='<div class="card"><h3>Всего найдено при скане</h3><div class="big">'+total+'</div><div class="small">это всё, что приложение смогло распознать как видео</div></div>'+
-    '<div class="card"><h3>Будет обработано по текущим настройкам</h3><div class="big cyan">'+match+'</div><div class="small">пересчитывается без нового сканирования</div></div>'+
-    '<div class="card"><h3>Не попадёт в обработку</h3><div class="big warn">'+skipped+'</div><div class="small">не прошло форматы/кодеки/размер/длительность/разрешение</div></div>'+
-    '<div class="card span3"><h3>Подходящий объём и форматы</h3><div class="big ok">'+humanBytes(res.bytes)+'</div><div class="small">'+esc(textExt)+'</div></div>';
+  let textExt=Object.entries(res.extMap).sort((a,b)=>b[1]-a[1]).map(x=>'.'+x[0]+': '+x[1]).join(' · ') || 'нет активных действий';
+  let moveLike=res.move+res.copy+res.hardlink;
+  box.innerHTML='<div class="card"><h3>Всего найдено</h3><div class="big">'+res.total+'</div><div class="small">все видео, которые удалось распознать</div></div>'+ 
+    '<div class="card"><h3>Будет ПЕРЕКОДИРОВАНО</h3><div class="big cyan">'+res.reencode+'</div><div class="small">только эти файлы реально пойдут через FFmpeg в новый кодек/размер</div></div>'+ 
+    '<div class="card"><h3>Уже H.265 — не трогать</h3><div class="big ok">'+res.ready+'</div><div class="small">готовые HEVC, которые будут пропущены</div></div>'+ 
+    '<div class="card"><h3>Без перекодирования</h3><div class="big blue">'+moveLike+'</div><div class="small">перенести/копировать/hardlink уже готовые H.265</div></div>'+ 
+    '<div class="card"><h3>Не попадёт в работу</h3><div class="big warn">'+res.filtered+'</div><div class="small">отсеяно фильтрами или кодеками</div></div>'+ 
+    '<div class="card"><h3>Объём перекодирования</h3><div class="big cyan">'+humanBytes(res.reencodeBytes)+'</div><div class="small">объём файлов, которые реально будут заново жаться</div></div>'+ 
+    '<div class="card span3"><h3>Итог по текущим настройкам</h3><div class="small">'+esc(actionSummaryText(res))+'</div><div class="small" style="margin-top:6px">Активные форматы: '+esc(textExt)+'</div></div>';
   let summary=document.getElementById('previewSummary');
   if(summary && previewData.lastText){
-    summary.textContent=previewData.lastText+'\n\nДИНАМИЧЕСКИЙ ПЕРЕСЧЁТ ПО ТЕКУЩИМ НАСТРОЙКАМ:\nБудет обработано: '+match+' из '+total+' файлов\nПодходящий объём: '+humanBytes(res.bytes)+'\nНе попадёт в обработку: '+skipped+'\nФорматы в обработке: '+textExt;
+    summary.textContent=previewData.lastText+'\n\nДИНАМИЧЕСКИЙ ПЕРЕСЧЁТ ПО ТЕКУЩИМ НАСТРОЙКАМ:'+
+      '\nБудет реально перекодировано: '+res.reencode+' из '+res.total+' файлов, объём '+humanBytes(res.reencodeBytes)+
+      '\nУже готовые H.265, которые не трогаем: '+res.ready+
+      '\nДействия без перекодирования с H.265: '+moveLike+' (перенести '+res.move+', скопировать '+res.copy+', hardlink '+res.hardlink+')'+
+      '\nНе попадёт в работу: '+res.filtered+
+      '\nАктивные форматы: '+textExt+
+      sampleLines(res);
   }
 }
-function renderPreviewResult(d){previewData=d;if(!d||!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+((d&&d.error)||'неизвестная ошибка')+'\n\nВыбранный путь: '+((d&&d.input_path)||'')+'\nПуть внутри контейнера: '+((d&&d.container_input_path)||'')+'\n\n'+(((d&&d.warnings)||[]).join('\n'));return}drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);let text='Сканирование завершено.\n\nЧто значит “Будет обработано”: это не просто найденные форматы, а файлы, которые сейчас проходят выбранные фильтры ниже: расширения, кодеки, разрешение, длительность и размер. Если поменяешь настройки — число пересчитается сразу, без нового скана.\n\nВыбранный путь: '+(d.input_path||'')+'\nПуть внутри контейнера: '+(d.container_input_path||'')+'\n\nВсего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\nБудет обработано по настройкам на момент скана: '+d.matched+'\nОбъём подходящих на момент скана: '+d.source_h+'\nНе подходит на момент скана: '+d.skipped+'\n';if(d.warnings?.length)text+='\nПредупреждения:\n'+d.warnings.map(x=>'- '+x).join('\n')+'\n';if(d.ext_stats?.length)text+='\nВсе найденные форматы:\n'+d.ext_stats.map(x=>'- .'+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.codec_stats?.length)text+='\nВсе найденные кодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';if(d.samples?.length)text+='\nПримеры подходящих файлов на момент скана:\n'+d.samples.slice(0,10).map(x=>'- '+x.size_h+' · .'+x.ext+' · '+x.codec+' · '+x.width+'x'+x.height+' · '+x.path).join('\n');previewData.lastText=text;document.getElementById('previewSummary').textContent=text;updateDynamicPreview()}
-async function previewFilters(){let obj=collectSettings();document.getElementById('previewSummary').textContent='Запускаю сканирование...';document.getElementById('dynamicPreview').innerHTML='<div class="card span3"><h3>Сканирование</h3><div class="big cyan">запуск...</div><div class="small">сейчас появится прогресс</div></div>';let start=await postJson('/api/preview/start',obj);if(!start.ok){document.getElementById('previewSummary').textContent='Не удалось запустить сканирование: '+(start.error||'unknown');return}for(let i=0;i<100000;i++){let stt=await getJson('/api/preview/status');let elapsed=stt.elapsed_seconds||0;let text='Статус: '+(stt.state||'')+'\n'+(stt.message||'')+'\n\nПросканировано: '+(stt.scanned||0)+' файлов\nПодходит сейчас: '+(stt.matched||0)+'\nНе подходит сейчас: '+(stt.skipped||0)+'\nВремя: '+elapsed+' сек.\n\nТекущий файл:\n'+(stt.current_path||'');document.getElementById('previewSummary').textContent=text;document.getElementById('dynamicPreview').innerHTML='<div class="card"><h3>Сканирование</h3><div class="big cyan">'+(stt.scanned||0)+'</div><div class="small">файлов просмотрено</div></div><div class="card"><h3>Подходит сейчас</h3><div class="big ok">'+(stt.matched||0)+'</div><div class="small">по фильтрам на момент запуска</div></div><div class="card"><h3>Не подходит</h3><div class="big warn">'+(stt.skipped||0)+'</div><div class="small">пропущено фильтрами</div></div>';if(!stt.running){if(stt.result){renderPreviewResult(stt.result)}else if(stt.error){document.getElementById('previewSummary').textContent='Ошибка сканирования: '+stt.error}break}await new Promise(r=>setTimeout(r,700))}}
+function renderPreviewResult(d){
+  previewData=d;
+  if(!d||!d.ok){document.getElementById('previewSummary').textContent='Ошибка: '+((d&&d.error)||'неизвестная ошибка')+'\n\nВыбранный путь: '+((d&&d.input_path)||'')+'\nПуть внутри контейнера: '+((d&&d.container_input_path)||'')+'\n\n'+(((d&&d.warnings)||[]).join('\n'));return}
+  drawPie(d.ext_stats||[]);renderExtChecks(d.ext_stats||[]);
+  let text='Сканирование завершено.\n\nВажно: “Будет перекодировано” — это только файлы, которые реально будут заново проходить FFmpeg. Уже готовые HEVC/H.265 считаются отдельно: их можно пропустить, перенести, скопировать или сделать hardlink без перекодирования.\n\nВыбранный путь: '+(d.input_path||'')+'\nПуть внутри контейнера: '+(d.container_input_path||'')+'\n\nВсего видеофайлов найдено: '+d.scanned+'\nОбщий объём найденного: '+d.all_source_h+'\n';
+  if(d.warnings?.length)text+='\nПредупреждения:\n'+d.warnings.map(x=>'- '+x).join('\n')+'\n';
+  if(d.ext_stats?.length)text+='\nВсе найденные форматы:\n'+d.ext_stats.map(x=>'- .'+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';
+  if(d.codec_stats?.length)text+='\nВсе найденные кодеки:\n'+d.codec_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';
+  if(d.resolution_stats?.length)text+='\nРазрешения:\n'+d.resolution_stats.map(x=>'- '+x.name+': '+x.count+' шт, '+x.bytes_h).join('\n')+'\n';
+  previewData.lastText=text;document.getElementById('previewSummary').textContent=text;updateDynamicPreview()
+}
+async function previewFilters(){let obj=collectSettings();document.getElementById('previewSummary').textContent='Запускаю сканирование...';document.getElementById('dynamicPreview').innerHTML='<div class="card span3"><h3>Сканирование</h3><div class="big cyan">запуск...</div><div class="small">сейчас появится прогресс</div></div>';let start=await postJson('/api/preview/start',obj);if(!start.ok){document.getElementById('previewSummary').textContent='Не удалось запустить сканирование: '+(start.error||'unknown');return}for(let i=0;i<100000;i++){let stt=await getJson('/api/preview/status');let elapsed=stt.elapsed_seconds||0;let text='Статус: '+(stt.state||'')+'\n'+(stt.message||'')+'\n\nПросканировано: '+(stt.scanned||0)+' файлов\nПодходит под фильтры при скане: '+(stt.matched||0)+'\nНе подходит сейчас: '+(stt.skipped||0)+'\nВремя: '+elapsed+' сек.\n\nТекущий файл:\n'+(stt.current_path||'');document.getElementById('previewSummary').textContent=text;document.getElementById('dynamicPreview').innerHTML='<div class="card"><h3>Сканирование</h3><div class="big cyan">'+(stt.scanned||0)+'</div><div class="small">файлов просмотрено</div></div><div class="card"><h3>Подходит под фильтры</h3><div class="big ok">'+(stt.matched||0)+'</div><div class="small">грубая оценка во время скана</div></div><div class="card"><h3>Не подходит</h3><div class="big warn">'+(stt.skipped||0)+'</div><div class="small">пропущено фильтрами</div></div>';if(!stt.running){if(stt.result){renderPreviewResult(stt.result)}else if(stt.error){document.getElementById('previewSummary').textContent='Ошибка сканирования: '+stt.error}break}await new Promise(r=>setTimeout(r,700))}}
 async function loadJobs(){let stv=document.getElementById('jobStatus').value;let data=await getJson('/api/jobs?limit=500'+(stv?'&status='+encodeURIComponent(stv):''));document.getElementById('jobsBody').innerHTML=data.jobs.map(j=>'<tr><td><span class="pill">'+esc(st(j.status))+'</span></td><td>'+esc(j.progress_percent||0)+'%</td><td class="path mono">'+fmtPath(j.source_path)+'</td><td class="path mono">'+fmtPath(j.output_path)+'</td><td>'+esc(j.source_size_h)+' → '+esc(j.output_size_h)+'</td><td class="path">'+esc(j.error_message||'')+'</td><td><button class="btn" onclick="retryJob(\''+j.id+'\')">повторить</button> <button class="btn yellow" onclick="moveFailed(\''+j.id+'\')">в failed</button></td></tr>').join('')}
 async function retryJob(id){await postJson('/api/jobs/'+id+'/retry',{});loadJobs()} async function moveFailed(id){await postJson('/api/jobs/'+id+'/move-to-failed',{});loadJobs()} async function loadLogs(kind){let d=await getJson('/api/logs?kind='+kind+'&lines=300');document.getElementById('logBox').textContent=d.text||''}
 function openBrowser(target,mode){browserTarget=target;browserMode=mode;document.getElementById('browserModal').classList.add('show');browseTo(document.getElementById('set_'+target)?.value||'')}function closeBrowser(){document.getElementById('browserModal').classList.remove('show')}
